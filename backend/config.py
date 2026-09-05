@@ -12,6 +12,11 @@ class Settings(BaseSettings):
     OLLAMA_MODEL: str = "llama3.1:8b"
 
     # AWS Bedrock Settings
+    # Supported & Benchmarked Models:
+    # - Default 8B:  "us.meta.llama3-1-8b-instruct-v1:0" (Meta Llama 3.1 8B Instruct)
+    # - 3B Model:    "mistral.ministral-3-3b-instruct"   (Mistral Ministral 3B - ultra-fast ~540ms)
+    # - 3B Micro:    "amazon.nova-micro-v1:0"             (Amazon Nova Micro)
+    # - 4B Model:    "google.gemma-3-4b-it"               (Google Gemma 3 4B IT)
     AWS_ACCESS_KEY_ID: str = ""
     AWS_SECRET_ACCESS_KEY: str = ""
     AWS_REGION: str = "us-east-1"

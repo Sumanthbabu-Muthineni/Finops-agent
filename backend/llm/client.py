@@ -1,9 +1,13 @@
+import os
 import json
 import re
+import logging
 from typing import Dict, Any, List, Optional
 import httpx
 from backend.config import settings
 from backend.core.models import FinancialQueryAST, AnomalyInfo
+
+logger = logging.getLogger(__name__)
 
 class BaseLLMClient:
     def complete(self, prompt: str, system: str = "") -> str:
@@ -36,7 +40,7 @@ class OllamaClient(BaseLLMClient):
             return MockLLMClient().complete(prompt, system)
 
 class BedrockClient(BaseLLMClient):
-    def __init__(self):
+    def __init__(self, model_id: Optional[str] = None):
         import boto3
         client_kwargs = {
             "service_name": "bedrock-runtime",
@@ -47,21 +51,25 @@ class BedrockClient(BaseLLMClient):
             client_kwargs["aws_secret_access_key"] = settings.AWS_SECRET_ACCESS_KEY
             
         self.client = boto3.client(**client_kwargs)
-        self.model_id = settings.BEDROCK_MODEL_ID
+        self.model_id = model_id or os.getenv("BEDROCK_MODEL_ID", settings.BEDROCK_MODEL_ID)
 
     def complete(self, prompt: str, system: str = "") -> str:
+        active_model = os.getenv("BEDROCK_MODEL_ID", self.model_id)
         try:
             messages = [{"role": "user", "content": [{"text": prompt}]}]
             system_prompts = [{"text": system}] if system else []
 
             response = self.client.converse(
-                modelId=self.model_id,
+                modelId=active_model,
                 messages=messages,
                 system=system_prompts,
                 inferenceConfig={"temperature": 0.0, "maxTokens": 800}
             )
             return response["output"]["message"]["content"][0]["text"]
         except Exception as e:
+            if os.getenv("BEDROCK_STRICT", "false").lower() in ("true", "1"):
+                raise RuntimeError(f"Bedrock invocation failed for model '{active_model}': {e}") from e
+            logger.warning(f"Bedrock ({active_model}) call failed: {e}. Falling back to MockLLMClient.")
             return MockLLMClient().complete(prompt, system)
 
 class GroqClient(BaseLLMClient):
@@ -311,10 +319,10 @@ class MockLLMClient(BaseLLMClient):
         })
 
 class LLMAdapter:
-    def __init__(self):
+    def __init__(self, model_id: Optional[str] = None):
         provider = settings.LLM_PROVIDER.lower()
         if provider == "bedrock":
-            self.client = BedrockClient()
+            self.client = BedrockClient(model_id=model_id)
         elif provider == "groq" and settings.GROQ_API_KEY:
             self.client = GroqClient()
         elif provider == "ollama":

@@ -235,7 +235,52 @@ Open `http://localhost:5173` in your browser.
 
 ---
 
-## 6. Evaluation Criteria Mapping
+## 6. Automated Testing & Verification Suites
+
+The codebase includes 5 automated test suites covering dynamic schema linking, PII security masking, multi-turn state preservation, 24 benchmark production questions, and 8B vs 3B vs 4B model evaluation benchmarks.
+
+### Running Individual Test Suites
+Always run test commands from the project root (`finops/`):
+
+```bash
+# 1. Universal Schema Dynamicity Suite (7 tests)
+python3 backend/tests/test_universal_schema_dynamicity.py
+
+# 2. TBX Banking & Security Masking Suite (5 tests)
+python3 backend/tests/test_tbx_banking_assistant.py
+
+# 3. Multi-Turn Conversation & Memory Suite (4 tests)
+python3 backend/tests/test_conversation_agent_multiturn.py
+
+# 4. Complete Team Benchmark Questions Suite (24 production queries)
+python3 backend/tests/test_team_benchmark_questions.py
+
+# 5. Multi-Model Benchmark & Hallucination Evaluation (8B vs 3B vs 4B)
+python3 backend/tests/evaluation_model8b4b3b.py
+```
+
+### Run All Tests in One Command
+```bash
+python3 backend/tests/test_universal_schema_dynamicity.py && \
+python3 backend/tests/test_tbx_banking_assistant.py && \
+python3 backend/tests/test_conversation_agent_multiturn.py && \
+python3 backend/tests/test_team_benchmark_questions.py && \
+python3 backend/tests/evaluation_model8b4b3b.py
+```
+
+### Test Coverage Overview
+
+| Test Suite | File | What is Covered |
+| :--- | :--- | :--- |
+| **Universal Schema Dynamicity** | `backend/tests/test_universal_schema_dynamicity.py` | Validates dynamic table & column discovery from PostgreSQL `information_schema`, schema-driven query compilation, `group_by` mapping, and zero-math dual SQL compilation. |
+| **TBX Banking & Security** | `backend/tests/test_tbx_banking_assistant.py` | Verifies analytical view queries (`v_transactions`, `v_accounts`, `v_banks`), strict PII masking (`****9069`), RapidFuzz bank acronym matching, and IQR statistical outlier detection ($Q_3 + 1.5 \cdot \text{IQR}$). |
+| **Multi-Turn Dialogue & Memory** | `backend/tests/test_conversation_agent_multiturn.py` | Tests zero-friction shorthand resolution (HDFC/SBI), affirmation understanding (*"yes you are right"*), context isolation (*"how many rows in db"* does not attribute to active vendor), and non-conflicting date filters. |
+| **Team Benchmark Suite** | `backend/tests/test_team_benchmark_questions.py` | 24 end-to-end production queries across 5 categories: Spend Breakdowns (Swiggy, GST, Paresh), Numeric Thresholds (> ₹10k, SBI debits > 200k), Leap Day & Holiday Calendar Math (Feb 29 2024, Christmas-New Year 2025), Statistical Anomalies, and Anti-Hallucination Guardrails. |
+| **Model Evaluation (8B vs 4B vs 3B)** | `backend/tests/evaluation_model8b4b3b.py` | Empirical benchmark comparing Meta Llama 3.1 8B vs Mistral 3B vs Google Gemma 3 4B on AWS Bedrock across latency, JSON AST schema faithfulness, cash flow directionality, and financial hallucination rates. |
+
+---
+
+## 7. Evaluation Criteria Mapping
 
 | Evaluation Criteria | Weight | Implementation Mapping |
 | :--- | :--- | :--- |

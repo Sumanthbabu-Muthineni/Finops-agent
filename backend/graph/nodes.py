@@ -151,20 +151,18 @@ def db_execution_and_iqr_node(state: FinancialAgentState) -> Dict[str, Any]:
     # 3. Trigger IQR Anomaly Hook
     records_df, anomaly_info = iqr_detector.detect(records_df, amount_col="amount")
 
-    # Format summary KPI cards (ONLY when records exist and have valid non-NaN values)
     summary_metrics = []
     breakdown_items = []
     ast_dict = state.get("current_ast") or {}
     is_grouped = bool(ast_dict.get("group_by"))
+    is_balance_query = (state.get("target_domain") == "accounts") or any(
+        w in state.get("user_query", "").lower() for w in ["balance", "balances"]
+    )
 
     if not summary_df.empty and row_count > 0:
         cols = list(summary_df.columns)
         # Check if query produced grouped results (e.g. breakdown by transaction_type, bank_name, etc.)
         group_cols = [c for c in cols if c not in ["total_amount", "record_count", "average_amount"]]
-
-        is_balance_query = (state.get("target_domain") == "accounts") or any(
-            w in state.get("user_query", "").lower() for w in ["balance", "balances"]
-        )
 
         if is_grouped and group_cols:
             total_grouped_spend = 0.0
