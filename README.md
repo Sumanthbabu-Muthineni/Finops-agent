@@ -109,133 +109,43 @@ finops/
 
 ## 4. Quickstart Setup
 
-### Step 1: Configure AWS Bedrock & PostgreSQL
-Create or edit `.env` in the root directory:
-```env
-LLM_PROVIDER=bedrock
-BEDROCK_MODEL_ID=us.meta.llama3-1-8b-instruct-v1:0
-AWS_ACCESS_KEY_ID=<your-aws-access-key>
-AWS_SECRET_ACCESS_KEY=<your-aws-secret-key>
-AWS_DEFAULT_REGION=us-east-1
+> [!NOTE]
+> All AWS Bedrock credentials, model IDs, and PostgreSQL connection settings are pre-configured in the submitted `.env` file in the root directory.
 
-# PostgreSQL Configuration
-DATABASE_URL=postgresql://postgres:postgres@localhost:5432/finops
-POSTGRES_HOST=localhost
-POSTGRES_PORT=5432
-POSTGRES_DB=finops
-POSTGRES_USER=postgres
-POSTGRES_PASSWORD=postgres
-```
-*(If AWS credentials are omitted, the system automatically falls back to an internal deterministic 8B simulator with 100% offline functionality).*
-
-### Step 2: Start PostgreSQL & Seed Database
-
-You can run PostgreSQL locally or via Docker:
-
+### Step 1: Install Dependencies
 ```bash
-# Option A: Start PostgreSQL in Docker (Port 5432)
-docker run -d --name finops-postgres -p 5432:5432 -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=finops postgres:16
+# Install backend Python dependencies
+pip install -r backend/requirements.txt
 
-# Seed base schema, B-Tree indexes, analytical views, and 50,000+ synthetic transactions
+# Install frontend Node dependencies
+cd frontend && npm install && cd ..
+```
+
+### Step 2: Seed the PostgreSQL Database
+Initializes the schema, B-Tree indexes, analytical views, and seeds transactions:
+```bash
 python3 backend/database/seed_postgres.py
 ```
 
-### Step 3: Set Up Python Virtual Environment & Start Backend
-
-> [!IMPORTANT]
-> Always execute commands from the **root repository directory (`finops/`)**. Do not `cd` into the `backend/` folder before launching `uvicorn`, otherwise Python will raise `ModuleNotFoundError: No module named 'backend'`.
-
-#### 1. Create and Activate Virtual Environment
-
-**On macOS / Linux:**
-```bash
-# Navigate to the project root
-cd finops
-
-# Create a virtual environment named 'venv'
-python3 -m venv venv
-
-# Activate the virtual environment
-source venv/bin/activate
-
-# Upgrade pip and install all backend dependencies
-pip install --upgrade pip
-pip install -r backend/requirements.txt
-```
-
-**On Windows (PowerShell):**
-```powershell
-# Navigate to the project root
-cd finops
-
-# Create virtual environment
-python -m venv venv
-
-# Activate the virtual environment
-.\venv\Scripts\Activate.ps1
-
-# Install dependencies
-pip install --upgrade pip
-pip install -r backend\requirements.txt
-```
-
-#### 2. Launch the FastAPI Backend Server
-With your virtual environment activated, run:
+### Step 3: Start the Backend Server (FastAPI + LangGraph)
 ```bash
 python3 -m uvicorn backend.app:app --host 0.0.0.0 --port 8000 --reload
 ```
 * **API Server**: `http://localhost:8000`
-* **Swagger API Documentation**: `http://localhost:8000/docs`
+* **Swagger API Docs**: `http://localhost:8000/docs`
 * **Health Check**: `http://localhost:8000/api/health`
 
-*(To exit the virtual environment later, simply run `deactivate` in your terminal).*
-
----
-
-### Step 3: Start the Frontend (React + Vite)
-In a new terminal window:
+### Step 4: Start the Frontend (React + Vite)
+In a separate terminal window:
 ```bash
 cd frontend
-npm install
 npm run dev
 ```
-Open `http://localhost:5173` in your browser.
+Open **`http://localhost:5173`** in your browser.
 
 ---
 
-## 5. Sample Banking Questions & System Responses
-
-### Question 1: Total Available Balance
-> **User**: *"What is our total available balance across all banks?"*  
-> **Assistant**: *"Total available balance is **$-17,718,722.09** across **13** accounts."*  
-> **UI Output**: KPI cards for Total Balance, Accounts, and Average Balance; sorted AG Grid table with all accounts strictly masked (`****9069`), and SQL Audit Drawer.
-
-### Question 2: Credit vs Debit Breakdown & Anomaly Detection
-> **User**: *"How much was credited vs debited in June 2026?"*  
-> **Assistant**: *"**$500,481.76** is **credit** (8 records) and **$2,975,637.00** is **debit** (25 records), totaling **$3,476,118.76**. ⚠️ **Anomaly Alert:** Statistical Outlier Detected: 1 payout(s) exceeded the historical upper bound of $166,031.05 (highest: $1,850,000.00). Typical baseline is $21,937.63 – $79,575.00."*  
-> **UI Output**: Dynamic KPI cards for Credit Amount and Debit Amount; table of 33 records with outlier row highlighted in amber.
-
-### Question 3: Plaintext Reference ID Search (Exact Lookup)
-> **User**: *"Lookup transaction reference 1715499972"*  
-> **Assistant**: *"Found matching **DEBIT** transaction: reference **1715499972** for **$14,866.00** at **HDFC BANK LIMITED** (Account ****9069)."*  
-> **UI Output**: Exact single record retrieved in AG Grid, UTR hash and account number masked, reference ID preserved in plaintext.
-
-### Question 4: Disambiguation & Multi-Turn Session Memory
-> **User**: *"Show transactions for SBI"*  
-> **Assistant**: *"Did you mean **STATE BANK OF INDIA (SBI)**? Please confirm below to view payouts and transactions."*  
-> **User**: *"yes"*  
-> **Assistant**: *"Total calculated is **$1,801,776.90** across **37** transactions..."*  
-> **User**: *"How much was debit?"* (Follow-up inherits SBI without re-prompting)  
-> **Assistant**: *"For **STATE BANK OF INDIA**, **$9,133,590.23** is **debit** (152 records)."*  
-
-### Question 5: Hallucination Guardrail & Chit-Chat Interception
-> **User**: *"Who is the CEO of Google?"*  
-> **Assistant**: *"I am specifically designed to assist with company financial & banking operations... I cannot assist with general knowledge questions."*  
-> **UI Output**: Synthesis halted, confidence gate closed, clickable suggestion pills displayed.
-
----
-
-## 6. Automated Testing & Verification Suites
+## 5. Automated Testing & Verification Suites
 
 The codebase includes 5 automated test suites covering dynamic schema linking, PII security masking, multi-turn state preservation, 24 benchmark production questions, and 8B vs 3B vs 4B model evaluation benchmarks.
 
@@ -280,7 +190,7 @@ python3 backend/tests/evaluation_model8b4b3b.py
 
 ---
 
-## 7. Evaluation Criteria Mapping
+## 6. Evaluation Criteria Mapping
 
 | Evaluation Criteria | Weight | Implementation Mapping |
 | :--- | :--- | :--- |
