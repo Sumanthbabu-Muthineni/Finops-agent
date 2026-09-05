@@ -81,19 +81,7 @@ def chat_endpoint(request: ChatRequest):
         "active_context_vendor": None
     })
 
-    # Check multi-turn confirmation for acronyms (e.g. User replies 'yes' to 'Did you mean Amazon Web Services?')
-    pending_vendor = session.get("pending_confirmation_vendor")
-    pending_alias = session.get("pending_alias")
-    clean_msg = user_query.strip().lower()
-    if pending_vendor and clean_msg in ["yes", "confirm", "yup", "yeah", "sure", "correct", "please", "yes please", "do it"]:
-        user_query = f"Show spend for {pending_vendor}"
-        if pending_alias:
-            session["confirmed_entities"][pending_alias] = pending_vendor
-        session["active_context_vendor"] = pending_vendor
-        for alias in entity_resolver.get_aliases_for_vendor(pending_vendor):
-            session["confirmed_entities"][alias] = pending_vendor
-        session["pending_confirmation_vendor"] = None
-        session["pending_alias"] = None
+
 
     # Prepare initial LangGraph state
     initial_state = {

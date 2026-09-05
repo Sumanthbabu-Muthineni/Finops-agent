@@ -12,22 +12,31 @@ from backend.analytics.confidence import confidence_evaluator
 from backend.core.intent_classifier import intent_classifier
 from backend.core.masking import mask_records_dataframe
 
+from backend.core.conversation_agent import conversation_agent
+
 def intent_and_entity_node(state: FinancialAgentState) -> Dict[str, Any]:
-    """Node 1: Checks scope/greeting intent and resolves entities with multi-turn session awareness."""
+    """Node 1: Checks scope/greeting intent and resolves multi-turn conversational context using ConversationContextAgent."""
     query = state["user_query"]
     session_confirmed = dict(state.get("session_confirmed_entities") or {})
     active_vendor = state.get("active_context_vendor")
+    history = state.get("conversation_history") or []
 
-    # 1. Hallucination Guardrail & Chit-Chat Interception
-    intent_type, direct_response = intent_classifier.classify(query, llm_client=llm_adapter.client)
+    # 1. Agentic Conversational Reasoning (Zero brittle regex / hardcoded lists)
+    conv_res = conversation_agent.resolve(
+        query=query,
+        conversation_history=history,
+        active_context_vendor=active_vendor,
+        llm_client=llm_adapter.client
+    )
+
+    intent_type = conv_res.intent
     if intent_type in ["GREETING", "OUT_OF_SCOPE"]:
-        # Dynamically pull sample vendors directly from loaded database
         sample_vendors = entity_resolver.vendors[:4]
         return {
             "intent_type": intent_type,
             "resolved_vendor": None,
             "entity_score": 1.0,
-            "final_narrative": direct_response,
+            "final_narrative": conv_res.conversational_reply or "I am your enterprise FinOps Banking Assistant.",
             "status": "success" if intent_type == "GREETING" else "out_of_scope",
             "db_records": [],
             "summary_metrics": [],
@@ -42,69 +51,44 @@ def intent_and_entity_node(state: FinancialAgentState) -> Dict[str, Any]:
             "breakdown_items": []
         }
 
-    # 2. Dynamic, Session-Aware Entity Resolution (Zero Hardcoding)
-    resolved_vendor, score, requires_confirmation, suggestions, matched_alias = entity_resolver.resolve_with_session(
-        query=query,
-        session_confirmed_entities=session_confirmed,
-        active_context_vendor=active_vendor
-    )
+    # 2. Use the disambiguated standalone query from the Conversation Agent
+    resolved_query = conv_res.standalone_query or query
+    resolved_vendor = conv_res.resolved_bank
+    context_scope = conv_res.context_scope
 
-    # If an ambiguous acronym/shorthand was encountered for the first time without prior session confirmation:
-    if requires_confirmation and resolved_vendor:
-        alias_display = f" ({matched_alias.upper()})" if matched_alias else ""
-        return {
-            "intent_type": "FINANCIAL",
-            "resolved_vendor": None,
-            "entity_score": score,
-            "final_narrative": (
-                f"Did you mean **{resolved_vendor}{alias_display}**? "
-                f"Please confirm below to view payouts and transactions."
-            ),
-            "status": "clarification_needed",
-            "db_records": [],
-            "summary_metrics": [],
-            "breakdown_items": [],
-            "row_count": 0,
-            "execution_time_ms": 0.0,
-            "anomaly": None,
-            "confidence": {
-                "score": score,
-                "tier": "MEDIUM",
-                "entity_score": score,
-                "ast_score": 1.0,
-                "data_score": 0.0,
-                "explanation": f"Disambiguation requested for '{matched_alias}'. Please confirm canonical vendor '{resolved_vendor}'."
-            },
-            "clarification_options": [resolved_vendor],
-            "needs_clarification": True,
-            "active_context_vendor": active_vendor,
-            "session_confirmed_entities": session_confirmed
-        }
-
-    import re
-    # Check if query is explicitly an all-entities / global query
-    is_global = bool(re.search(
-        r"\b(all entities|all vendors|all companies|all accounts|every vendor|across all|select all|for all entities|for all vendors|for all companies|for all|all of them|everyone)\b",
-        query.lower()
-    ))
-    if is_global:
+    # If the conversation agent resolved a specific bank:
+    if resolved_vendor:
+        active_vendor = resolved_vendor
+        for alias in entity_resolver.get_aliases_for_vendor(resolved_vendor):
+            session_confirmed[alias] = resolved_vendor
+        score = 1.0
+        suggestions = []
+    elif context_scope == "GLOBAL":
+        # Global query: completely clear active single-bank context!
         active_vendor = None
         resolved_vendor = None
         score = 1.0
         suggestions = []
-
-    # If vendor resolved with confidence:
-    if resolved_vendor:
-        # Update active vendor context
-        active_vendor = resolved_vendor
-        # Register all dynamic aliases for this vendor so subsequent turns never re-ask!
-        for alias in entity_resolver.get_aliases_for_vendor(resolved_vendor):
-            session_confirmed[alias] = resolved_vendor
-        if matched_alias:
-            session_confirmed[matched_alias] = resolved_vendor
+    else:
+        # Fallback to entity resolver for keyword / alias checks on the resolved query
+        er_vendor, er_score, er_req, er_sugg, er_alias = entity_resolver.resolve_with_session(
+            query=resolved_query,
+            session_confirmed_entities=session_confirmed,
+            active_context_vendor=active_vendor
+        )
+        if er_vendor:
+            resolved_vendor = er_vendor
+            active_vendor = er_vendor
+            score = er_score
+            suggestions = []
+        else:
+            resolved_vendor = None
+            score = er_score
+            suggestions = er_sugg
 
     return {
         "intent_type": "FINANCIAL",
+        "user_query": resolved_query,
         "resolved_vendor": resolved_vendor,
         "entity_score": score,
         "active_context_vendor": active_vendor,
@@ -282,6 +266,21 @@ def db_execution_and_iqr_node(state: FinancialAgentState) -> Dict[str, Any]:
             total = records_df["amount"].sum()
             summary_metrics.append({"label": "Total Amount", "value": f"${float(total):,.2f}"})
 
+    # For account inquiries, enrich with total transaction volume across these accounts
+    if is_balance_query and not records_df.empty and "account_id" in records_df.columns:
+        try:
+            acc_ids = [r for r in records_df["account_id"].dropna().tolist() if r]
+            if acc_ids:
+                cnt_df, _, _ = db.execute_query(
+                    "SELECT COUNT(*) AS txn_count FROM transaction WHERE account_id = ANY(%s)",
+                    (acc_ids,)
+                )
+                if not cnt_df.empty and pd.notnull(cnt_df["txn_count"].iloc[0]):
+                    txn_cnt = int(cnt_df["txn_count"].iloc[0])
+                    summary_metrics.append({"label": "Total Transactions", "value": f"{txn_cnt:,}"})
+        except Exception:
+            pass
+
     # Determine if query warrants displaying a raw data table in the UI
     # Single-number / pure aggregate questions (e.g. "What is our total balance?")
     # should only display KPI cards, not dump all individual underlying accounts/transactions.
@@ -292,7 +291,7 @@ def db_execution_and_iqr_node(state: FinancialAgentState) -> Dict[str, Any]:
     is_pure_aggregate = (
         not has_grouping 
         and ast_metric in ["total_amount", "available_balance", "average_amount", "record_count"]
-        and not any(w in user_q for w in ["show", "list", "lookup", "details", "recent", "find", "top", "negative", "transactions", "records", "accounts"])
+        and not any(w in user_q for w in ["show", "list", "lookup", "details", "recent", "find", "top", "negative", "transactions", "records", "accounts", "how many accounts", "how many accoutns", "which accounts", "who paid", "who credited", "creditor"])
     )
 
     if is_pure_aggregate:
@@ -380,7 +379,16 @@ def synthesizer_node(state: FinancialAgentState) -> Dict[str, Any]:
     anomaly_obj = AnomalyInfo(**anomaly_dict) if anomaly_dict else AnomalyInfo()
     sample_rows = state.get("db_records", [])
     breakdown_items = state.get("breakdown_items") or []
-    resolved_vendor = state.get("resolved_vendor") or state.get("active_context_vendor")
+    # Check if the executed query actually filtered on bank_name / vendor_name
+    ast_dict = state.get("current_ast") or {}
+    filters = ast_dict.get("entity_filters") or []
+    has_bank_filter = any(f.get("field") in ["bank_name", "vendor_name", "bank_code"] for f in filters)
+
+    if has_bank_filter:
+        resolved_vendor = state.get("resolved_vendor") or state.get("active_context_vendor")
+    else:
+        # Company-Wide / Global Query: NEVER attribute company-wide totals to an active vendor!
+        resolved_vendor = None
 
     # Extract metrics for synthesizer
     metrics_map = {}
@@ -390,10 +398,19 @@ def synthesizer_node(state: FinancialAgentState) -> Dict[str, Any]:
         num_val = val.replace("$", "").replace(",", "")
         if lbl in ["Total Spend", "Total Amount", "Total Balance"]:
             metrics_map["total_amount"] = num_val
-        elif lbl in ["Transactions", "Accounts", "Total Accounts", "Total Transactions", "Records Found"]:
+        elif lbl in ["Transactions", "Accounts", "Total Accounts", "Records Found"]:
             metrics_map["record_count"] = num_val
+        elif lbl == "Total Transactions":
+            metrics_map["total_transactions"] = num_val
         elif lbl in ["Average Payout", "Average Amount", "Average Transaction", "Average Balance"]:
             metrics_map["average_amount"] = num_val
+
+    # Identify domain unit: bank accounts vs transactions
+    target_domain = state.get("target_domain") or ast_dict.get("target_domain") or "transactions"
+    is_balance_q = (target_domain == "accounts") or any(
+        w in query.lower() for w in ["balance", "balances", "account", "accounts"]
+    )
+    domain_unit = "bank accounts" if is_balance_q else "transactions"
 
     narrative = llm_adapter.synthesize_narrative(
         query=query,
@@ -401,7 +418,8 @@ def synthesizer_node(state: FinancialAgentState) -> Dict[str, Any]:
         anomaly=anomaly_obj,
         sample_rows=sample_rows,
         breakdown_items=breakdown_items,
-        resolved_vendor=resolved_vendor
+        resolved_vendor=resolved_vendor,
+        unit=domain_unit
     )
 
     return {

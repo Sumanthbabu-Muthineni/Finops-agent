@@ -130,12 +130,8 @@ class EntityResolver:
                 if active_context_vendor == canonical:
                     return canonical, 1.0, False, [], alias
 
-                # If it's a short acronym/shorthand encountered for the FIRST time, ask for confirmation
-                is_short_alias = (alias != canonical.lower())
-                if is_short_alias:
-                    return canonical, 0.65, True, [canonical], alias
-                else:
-                    return canonical, 1.0, False, [], alias
+                # Unambiguous dynamic aliases (bank codes, standard acronyms) resolve with 100% confidence
+                return canonical, 1.0, False, [], alias
 
         # 5. Fuzzy string fallback via RapidFuzz
         words = [w.strip("?,.!'\"") for w in query.split() if len(w) > 2]

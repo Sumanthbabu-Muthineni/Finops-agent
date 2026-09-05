@@ -54,7 +54,10 @@ class IntentClassifier:
         if tokens.intersection(FINANCIAL_KEYWORDS):
             return "FINANCIAL", None
 
-        # Check conversational responses or selection terms (e.g. "select all", "for all", "neither")
+        # Check conversational responses, affirmations, or selection terms
+        if re.search(r"^(yes|yep|yeah|yup|correct|right|yes you are right|you are right|that's right|thats right|sure|confirm|confirmed|proceed|go ahead|ok|okay|please|yes please|do it)[\s\.,!\?]*$", clean_q):
+            return "FINANCIAL", None
+
         if re.search(r"\b(all|select all|for all|all entities|all vendors|both|neither|everything|everyone)\b", clean_q):
             return "FINANCIAL", None
 
