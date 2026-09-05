@@ -1,12 +1,12 @@
 import React, { useMemo } from 'react';
 import { AgGridReact } from 'ag-grid-react';
-import { ModuleRegistry, AllCommunityModule } from 'ag-grid-community';
+import { ModuleRegistry, AllCommunityModule, ValidationModule } from 'ag-grid-community';
 import 'ag-grid-community/styles/ag-grid.css';
 import 'ag-grid-community/styles/ag-theme-alpine.css';
 import { CsvExportButton } from './CsvExportButton';
 
-// Register all community features
-ModuleRegistry.registerModules([AllCommunityModule]);
+// Register all community features and validation module
+ModuleRegistry.registerModules([AllCommunityModule, ValidationModule]);
 
 export const FinancialAgGrid = ({ rowData }) => {
   if (!rowData || rowData.length === 0) return null;
