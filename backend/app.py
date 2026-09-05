@@ -14,7 +14,7 @@ from backend.core.entity_resolver import entity_resolver
 
 app = FastAPI(
     title="TBX FinOps Assistant API",
-    description="Grounded conversational assistant for financial operations (DuckDB + LangGraph + 8B LLM)",
+    description="Grounded conversational assistant for financial operations (PostgreSQL + LangGraph + 8B LLM)",
     version="1.0.0"
 )
 

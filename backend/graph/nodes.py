@@ -1,4 +1,5 @@
 from typing import Dict, Any, List
+from datetime import datetime
 import pandas as pd
 from backend.graph.state import FinancialAgentState
 from backend.core.entity_resolver import entity_resolver
@@ -9,6 +10,7 @@ from backend.engine.query_compiler import query_compiler
 from backend.analytics.anomaly import iqr_detector
 from backend.analytics.confidence import confidence_evaluator
 from backend.core.intent_classifier import intent_classifier
+from backend.core.masking import mask_records_dataframe
 
 def intent_and_entity_node(state: FinancialAgentState) -> Dict[str, Any]:
     """Node 1: Checks scope/greeting intent and resolves entities with multi-turn session awareness."""
@@ -139,7 +141,7 @@ def ast_generator_node(state: FinancialAgentState) -> Dict[str, Any]:
     }
 
 def sql_compiler_node(state: FinancialAgentState) -> Dict[str, Any]:
-    """Node 3: Deterministic compilation from AST to parameterized DuckDB SQL."""
+    """Node 3: Deterministic compilation from AST to parameterized PostgreSQL SQL."""
     ast_dict = state["current_ast"]
     ast_obj = FinancialQueryAST(**ast_dict)
 
@@ -152,7 +154,7 @@ def sql_compiler_node(state: FinancialAgentState) -> Dict[str, Any]:
     }
 
 def db_execution_and_iqr_node(state: FinancialAgentState) -> Dict[str, Any]:
-    """Node 4: Executes DuckDB SQL (zero LLM math) and triggers IQR Anomaly Hook."""
+    """Node 4: Executes PostgreSQL SQL (zero LLM math) and triggers IQR Anomaly Hook."""
     compiled_sql = state["compiled_sql"]
     records_sql = state["records_sql"]
 
@@ -176,6 +178,10 @@ def db_execution_and_iqr_node(state: FinancialAgentState) -> Dict[str, Any]:
         # Check if query produced grouped results (e.g. breakdown by transaction_type, bank_name, etc.)
         group_cols = [c for c in cols if c not in ["total_amount", "record_count", "average_amount"]]
 
+        is_balance_query = (state.get("target_domain") == "accounts") or any(
+            w in state.get("user_query", "").lower() for w in ["balance", "balances"]
+        )
+
         if is_grouped and group_cols:
             total_grouped_spend = 0.0
             total_grouped_records = 0
@@ -193,24 +199,65 @@ def db_execution_and_iqr_node(state: FinancialAgentState) -> Dict[str, Any]:
                     "amount": round(amt, 2),
                     "count": cnt
                 })
-                # Dynamic KPI card for each group value (e.g. "Credit Amount", "Debit Amount")
-                metric_suffix = "Amount" if any(x in str(group_val).upper() for x in ["CREDIT", "DEBIT"]) else "Spend"
-                summary_metrics.append({
-                    "label": f"{val_str.title()} {metric_suffix}",
-                    "value": f"${amt:,.2f}"
-                })
 
-            if len(breakdown_items) > 1:
+            # For concise groupings (<= 3 items, e.g. Credit vs Debit), show individual KPI cards
+            if len(breakdown_items) <= 3:
+                for item in breakdown_items:
+                    val_str = item["name"]
+                    amt = item["amount"]
+                    if is_balance_query:
+                        metric_suffix = "Balance"
+                    elif any(x in val_str.upper() for x in ["CREDIT", "DEBIT"]):
+                        metric_suffix = "Amount"
+                    else:
+                        metric_suffix = "Spend"
+                    summary_metrics.append({
+                        "label": f"{val_str.title()} {metric_suffix}",
+                        "value": f"${amt:,.2f}"
+                    })
+
+                if len(breakdown_items) > 1:
+                    total_label = "Total Balance" if is_balance_query else "Total Amount"
+                    records_label = "Accounts" if is_balance_query else "Transactions"
+                    summary_metrics.append({
+                        "label": total_label,
+                        "value": f"${total_grouped_spend:,.2f}"
+                    })
+                    summary_metrics.append({
+                        "label": records_label,
+                        "value": str(total_grouped_records)
+                    })
+            else:
+                # For multi-item groupings (> 3 items, e.g. 10 companies), provide clean high-level executive cards
+                total_label = "Total Balance" if is_balance_query else "Total Amount"
+                records_label = "Total Accounts" if is_balance_query else "Total Transactions"
+                group_label = "Companies" if is_balance_query else "Categories"
+
+                # Identify highest item by amount
+                sorted_items = sorted(breakdown_items, key=lambda x: x["amount"], reverse=True)
+                top_item = sorted_items[0]
+
                 summary_metrics.append({
-                    "label": "Total Amount",
+                    "label": total_label,
                     "value": f"${total_grouped_spend:,.2f}"
                 })
                 summary_metrics.append({
-                    "label": "Transactions",
+                    "label": "Top Company" if is_balance_query else "Top Category",
+                    "value": top_item["name"].title()
+                })
+                summary_metrics.append({
+                    "label": "Top Balance" if is_balance_query else "Top Amount",
+                    "value": f"${top_item['amount']:,.2f}"
+                })
+                summary_metrics.append({
+                    "label": group_label,
+                    "value": str(len(breakdown_items))
+                })
+                summary_metrics.append({
+                    "label": records_label,
                     "value": str(total_grouped_records)
                 })
         else:
-            is_balance_query = (state.get("target_domain") == "accounts") or any(w in state.get("user_query", "").lower() for w in ["balance", "balances"])
             total_label = "Total Balance" if is_balance_query else "Total Amount"
             count_label = "Accounts" if is_balance_query else "Transactions"
             avg_label = "Average Balance" if is_balance_query else "Average Transaction"
@@ -235,17 +282,28 @@ def db_execution_and_iqr_node(state: FinancialAgentState) -> Dict[str, Any]:
             total = records_df["amount"].sum()
             summary_metrics.append({"label": "Total Amount", "value": f"${float(total):,.2f}"})
 
-    # Prepare table records (limit to 100 for fast UI rendering, clean NaT/NaN to None)
-    clean_records_df = records_df.copy()
+    # Determine if query warrants displaying a raw data table in the UI
+    # Single-number / pure aggregate questions (e.g. "What is our total balance?")
+    # should only display KPI cards, not dump all individual underlying accounts/transactions.
+    user_q = (state.get("user_query") or "").lower()
+    ast_metric = (ast_dict.get("target_metric") or "").lower()
+    has_grouping = bool(ast_dict.get("group_by"))
 
-    # SENSITIVE DATA MASKING (Mandatory): Never leak raw account numbers or full UTR hashes
-    if "masked_account_number" in clean_records_df.columns:
-        clean_records_df["account_number"] = clean_records_df["masked_account_number"]
-    if "masked_utr_number" in clean_records_df.columns:
-        clean_records_df["utr_number"] = clean_records_df["masked_utr_number"]
+    is_pure_aggregate = (
+        not has_grouping 
+        and ast_metric in ["total_amount", "available_balance", "average_amount", "record_count"]
+        and not any(w in user_q for w in ["show", "list", "lookup", "details", "recent", "find", "top", "negative", "transactions", "records", "accounts"])
+    )
 
-    clean_records_df = clean_records_df.astype(object).where(pd.notnull(clean_records_df), None)
-    records_list = clean_records_df.head(100).to_dict(orient="records")
+    if is_pure_aggregate:
+        records_list = []
+    else:
+        # Prepare table records (limit to 100 for fast UI rendering, clean NaT/NaN to None)
+        clean_records_df = records_df.copy()
+        # SENSITIVE DATA MASKING (Mandatory): Never leak raw account numbers or full UTR hashes
+        clean_records_df = mask_records_dataframe(clean_records_df)
+        clean_records_df = clean_records_df.astype(object).where(pd.notnull(clean_records_df), None)
+        records_list = clean_records_df.head(100).to_dict(orient="records")
 
     return {
         "db_records": records_list,
@@ -279,25 +337,28 @@ def confidence_gate_node(state: FinancialAgentState) -> Dict[str, Any]:
 
 def clarification_node(state: FinancialAgentState) -> Dict[str, Any]:
     """Node 6A: Halts hallucination when data is missing or query is ambiguous."""
+    query = state.get("user_query", "")
     resolved_vendor = state.get("resolved_vendor")
     row_count = state.get("row_count", 0)
     options = state.get("clarification_options") or entity_resolver.vendors[:4]
+    ast_dict = state.get("current_ast") or {}
+    date_range = ast_dict.get("date_range") or {}
+    start_date = date_range.get("start_date") if isinstance(date_range, dict) else getattr(date_range, "start_date", None)
+    end_date = date_range.get("end_date") if isinstance(date_range, dict) else getattr(date_range, "end_date", None)
 
-    if row_count == 0 and resolved_vendor:
-        narrative = (
-            f"No financial records were found for **'{resolved_vendor}'** matching your specified filters. "
-            f"Please verify the date range or check one of our active banks/entities: {', '.join(options[:4])}."
-        )
-    elif not resolved_vendor and options:
-        narrative = (
-            f"We couldn't clearly identify the bank, account, or program in your question. "
-            f"Did you mean one of these: **{', '.join(options[:4])}**?"
-        )
-    else:
-        narrative = (
-            "We could not locate data matching your query in the current financial datasets. "
-            "Please refine your query or ask about bank accounts, balances, transactions, or reference IDs."
-        )
+    cur_anchor = db.get_anchor_date()
+    max_db_dt = db.get_max_dataset_date()
+
+    narrative = llm_adapter.synthesize_clarification(
+        query=query,
+        resolved_vendor=resolved_vendor,
+        start_date=start_date,
+        end_date=end_date,
+        options=options,
+        cur_anchor=cur_anchor,
+        max_db_dt=max_db_dt,
+        row_count=row_count
+    )
 
     return {
         "final_narrative": narrative,
@@ -307,12 +368,13 @@ def clarification_node(state: FinancialAgentState) -> Dict[str, Any]:
         "db_records": [],
         "anomaly": None,
         "clarification_options": options[:4] if options else None,
+        "needs_clarification": True,
         "active_context_vendor": state.get("active_context_vendor"),
         "session_confirmed_entities": state.get("session_confirmed_entities")
     }
 
 def synthesizer_node(state: FinancialAgentState) -> Dict[str, Any]:
-    """Node 6B: Zero-Math synthesis using DuckDB calculated values."""
+    """Node 6B: Zero-Math synthesis using PostgreSQL calculated values."""
     query = state["user_query"]
     anomaly_dict = state.get("anomaly", {})
     anomaly_obj = AnomalyInfo(**anomaly_dict) if anomaly_dict else AnomalyInfo()
@@ -328,7 +390,7 @@ def synthesizer_node(state: FinancialAgentState) -> Dict[str, Any]:
         num_val = val.replace("$", "").replace(",", "")
         if lbl in ["Total Spend", "Total Amount", "Total Balance"]:
             metrics_map["total_amount"] = num_val
-        elif lbl in ["Transactions", "Accounts", "Records Found"]:
+        elif lbl in ["Transactions", "Accounts", "Total Accounts", "Total Transactions", "Records Found"]:
             metrics_map["record_count"] = num_val
         elif lbl in ["Average Payout", "Average Amount", "Average Transaction", "Average Balance"]:
             metrics_map["average_amount"] = num_val

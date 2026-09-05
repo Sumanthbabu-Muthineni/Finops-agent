@@ -63,7 +63,7 @@ class IntentClassifier:
         if known.get("found_vendors") or known.get("found_accounts") or known.get("found_categories"):
             return "FINANCIAL", None
 
-        # Check dynamic aliases (e.g. AWS, GCP, etc.) derived from DuckDB
+        # Check dynamic aliases (e.g. AWS, GCP, etc.) derived from PostgreSQL
         for alias in entity_resolver.dynamic_aliases:
             if re.search(r"\b" + re.escape(alias) + r"\b", clean_q):
                 return "FINANCIAL", None

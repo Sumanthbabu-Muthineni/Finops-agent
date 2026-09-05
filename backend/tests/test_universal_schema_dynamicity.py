@@ -12,7 +12,7 @@ from backend.core.models import FinancialQueryAST, EntityFilter, DateRangeFilter
 from backend.graph.workflow import financial_agent_graph
 
 def test_dynamic_schema_profile_introspection():
-    """Verify DuckDB dynamic schema profiling discovers columns and distinct values without hardcoding."""
+    """Verify PostgreSQL dynamic schema profiling discovers columns and distinct values without hardcoding."""
     profile = db.get_schema_profile()
     assert "transactions" in profile
     assert "accounts" in profile

@@ -23,7 +23,7 @@ class ConfidenceEvaluator:
         # 2. AST Score
         s_ast = 1.0 if ast_valid else 0.0
 
-        # 3. Data Score (DuckDB grounded reality)
+        # 3. Data Score (PostgreSQL grounded reality)
         if row_count > 0:
             s_data = 1.0
         else:
@@ -39,7 +39,7 @@ class ConfidenceEvaluator:
             explanation = (
                 f"High confidence ({int(score*100)}%): "
                 f"Entity matched ({int(s_entity*100)}%), valid query structure, "
-                f"and {row_count} records retrieved from DuckDB."
+                f"and {row_count} records retrieved from PostgreSQL."
             )
         elif score >= 0.65 and row_count > 0:
             tier = "MEDIUM"

@@ -93,9 +93,9 @@ export default function App() {
         </div>
 
         <div className="header-badges">
-          <div className="status-badge" title="Underlying OLAP Database">
+          <div className="status-badge" title="Underlying Relational Database">
             <span className="pulse-dot"></span>
-            <span>DuckDB Active</span>
+            <span>PostgreSQL Active</span>
           </div>
 
           <div className="status-badge" title="Model Efficiency Rubric">
@@ -119,11 +119,10 @@ export default function App() {
             </div>
             <h1>Ask Any Financial Operations Question</h1>
             <p>
-              100% grounded answers over bank accounts, credit/debit transactions, and ledger balances.
-              Every answer is accompanied by verifiable tabular records, masked sensitive accounts, and an audit trail.
+              Grounded, zero-hallucination answers powered by PostgreSQL analytics, automated IQR outlier detection, and dynamic schema inspection.
             </p>
 
-            <div className="sample-pills">
+            <div className="sample-questions-grid">
               {SAMPLE_QUESTIONS.map((q, idx) => (
                 <button
                   key={idx}
@@ -154,7 +153,7 @@ export default function App() {
               <div className="assistant-bubble" style={{ padding: '12px 18px' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                   <span style={{ fontSize: '0.85rem', color: '#94a3b8' }}>
-                    Compiling query & executing in DuckDB...
+                    Compiling query & executing in PostgreSQL...
                   </span>
                   <div className="typing-indicator">
                     <div className="typing-dot"></div>

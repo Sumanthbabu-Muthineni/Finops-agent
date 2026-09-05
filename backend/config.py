@@ -21,9 +21,19 @@ class Settings(BaseSettings):
     GROQ_API_KEY: str = ""
     GROQ_MODEL: str = "llama-3.1-8b-instant"
 
-    # Data Directory & Paths
-    DATA_DIR: str = "data"
+    # Database Configuration (PostgreSQL Native)
+    DATABASE_URL: str = "postgresql://postgres:postgres@localhost:5432/finops"
+    POSTGRES_HOST: str = "localhost"
+    POSTGRES_PORT: int = 5432
+    POSTGRES_DB: str = "finops"
+    POSTGRES_USER: str = "postgres"
+    POSTGRES_PASSWORD: str = "postgres"
+    POSTGRES_POOL_MIN: int = 2
+    POSTGRES_POOL_MAX: int = 20
     
+    # Evaluator Hash / Encryption Key (for UTR encryption at rest)
+    HASH_KEY: str = "finops-evaluator-secret-hashkey-2026"
+
     # Server & CORS
     CORS_ORIGINS: str = "http://localhost:5173,http://localhost:3000,http://localhost:8000"
     DEBUG: bool = True
@@ -38,22 +48,17 @@ class Settings(BaseSettings):
     def cors_origins_list(self) -> List[str]:
         return [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
 
-    @property
-    def data_path(self) -> Path:
-        base = Path(__file__).resolve().parent.parent
-        return base / self.DATA_DIR
-
 settings = Settings()
 
-# Official TBX Connected Banking Dataset Mapping (3 Tables)
+# Official TBX Relational Schema Table Definitions
 DATASET_SCHEMA_MAPPINGS = {
     "bank": {
-        "file": "bank.csv",
+        "table": "bank",
         "code_col": "bank_code",
         "name_col": "bank_name"
     },
     "account": {
-        "file": "account.csv",
+        "table": "account",
         "id_col": "account_id",
         "entity_id_col": "entity_id",
         "account_number_col": "account_number",
@@ -62,7 +67,7 @@ DATASET_SCHEMA_MAPPINGS = {
         "bank_code_col": "bank_code"
     },
     "transaction": {
-        "file": "transaction.csv",
+        "table": "transaction",
         "id_col": "transaction_id",
         "account_id_col": "account_id",
         "date_col": "transaction_date",

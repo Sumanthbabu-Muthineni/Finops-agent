@@ -17,11 +17,11 @@ class EntityResolver:
         self.accounts = []
         self.categories = []
 
-        # Query exact bank_code to bank_name mapping from DuckDB
+        # Query exact bank_code to bank_name mapping from PostgreSQL
         try:
-            b_rows = db.con.execute("SELECT bank_code, bank_name FROM bank;").fetchall()
-            self.code_to_name = {r[0]: r[1] for r in b_rows}
-            self.name_to_code = {r[1]: r[0] for r in b_rows}
+            b_df, _, _ = db.execute_query("SELECT bank_code, bank_name FROM bank;")
+            self.code_to_name = dict(zip(b_df["bank_code"], b_df["bank_name"]))
+            self.name_to_code = dict(zip(b_df["bank_name"], b_df["bank_code"]))
         except Exception:
             self.code_to_name = {}
             self.name_to_code = {}
@@ -85,12 +85,22 @@ class EntityResolver:
         confirmed_map = session_confirmed_entities or {}
 
         # 0. Check Global All-Entity Queries (e.g. "for all entities", "all vendors", "select all")
-        global_patterns = [
-            r"\b(all entities|all vendors|all companies|all accounts|every vendor|across all|select all|for all entities|for all vendors|for all companies|for all|all of them|everyone)\b"
-        ]
-        for p in global_patterns:
-            if re.search(p, clean_q):
-                return None, 1.0, False, [], None
+        # Only apply if NO specific bank or dynamic alias is in the query
+        has_specific_bank = any(
+            re.search(r"\b" + re.escape(alias) + r"\b", clean_q)
+            for alias in self.dynamic_aliases
+        ) or any(
+            re.search(r"\b" + re.escape(v.lower()) + r"\b", clean_q)
+            for v in self.vendors
+        )
+
+        if not has_specific_bank:
+            global_patterns = [
+                r"\b(all entities|all vendors|all companies|all accounts|every vendor|across all|select all|for all entities|for all vendors|for all companies|for all|all of them|everyone)\b"
+            ]
+            for p in global_patterns:
+                if re.search(p, clean_q):
+                    return None, 1.0, False, [], None
 
         # 1. Check Session Memory: Did the user already confirm or discuss this acronym/alias in this session?
         for term, canonical in confirmed_map.items():
@@ -166,7 +176,7 @@ class EntityResolver:
         clean_text = text.lower()
         found_banks = [b for b in self.banks if b.lower() in clean_text]
         found_codes = [c for c in self.bank_codes if re.search(r"\b" + re.escape(c.lower()) + r"\b", clean_text)]
-        found_programs = [p for p in self.programs if re.search(r"\b(program\s+" + re.escape(p) + r"|" + re.escape(p) + r")\b", clean_text)]
+        found_programs = [p for p in self.programs if re.search(r"\b(program\s+" + re.escape(str(p)) + r"|" + re.escape(str(p)) + r")\b", clean_text)]
 
         return {
             "found_banks": found_banks,

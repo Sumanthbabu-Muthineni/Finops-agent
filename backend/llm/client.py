@@ -100,11 +100,11 @@ class MockLLMClient(BaseLLMClient):
         schema_profile = db.get_schema_profile()
 
         # 1. Resolve bank/entity dynamically from session / query
-        is_global = bool(re.search(
-            r"\b(all entities|all banks|all accounts|every bank|across all|select all|for all entities|for all banks|for all|all of them|everyone)\b",
-            lower
-        ))
         bank_match, _, _, _, _ = entity_resolver.resolve_with_session(prompt)
+        is_global = bool(re.search(
+            r"\b(all entities|all banks|every bank|across all entities|across all banks|select all|for all entities|for all banks|everyone)\b",
+            lower
+        )) and not bank_match
         filters = []
         if bank_match and not is_global:
             filters.append({"field": "bank_name", "operator": "eq", "value": bank_match})
@@ -142,40 +142,98 @@ class MockLLMClient(BaseLLMClient):
         for d_cols in schema_profile.values():
             all_cols.update(d_cols.keys())
 
+        # 3. Detect dynamic group_by
+        group_by = []
+        all_cols = set()
+        for d_cols in schema_profile.values():
+            all_cols.update(d_cols.keys())
+
         # Check if credit vs debit breakdown requested
         if ("credit" in lower and "debit" in lower) or "by transaction type" in lower or "by type" in lower:
             group_by.append("transaction_type")
-        elif "by bank" in lower or "breakdown by bank" in lower or "compare by bank" in lower:
+        elif any(w in lower for w in [
+            "by bank", "breakdown by bank", "compare by bank", "each bank", "which bank", "which banks",
+            "by company", "breakdown by company", "each company", "each coompany", "which company", "which companies",
+            "with respect to each company", "with respect to each coompany",
+            "by vendor", "breakdown by vendor", "each vendor", "which vendor", "which vendors",
+            "by entity", "breakdown by entity", "each entity", "which entity", "which entities",
+            "by partner", "breakdown by partner", "each partner", "which partner"
+        ]):
             group_by.append("bank_name")
         elif "by program" in lower or "breakdown by program" in lower:
             group_by.append("program_id")
 
+        if any(w in lower for w in ["trend", "how has", "changed over", "over last", "over the last"]) and not group_by:
+            group_by.append("month")
+
         for col in all_cols:
             col_clean = col.replace("_", " ")
-            if re.search(r"\b(breakdown by|group by|compare by|by)\s+" + re.escape(col_clean) + r"\b", lower) or \
-               re.search(r"\b(breakdown by|group by|compare by|by)\s+" + re.escape(col) + r"\b", lower):
-                if col not in group_by and col not in ["transaction_amount", "amount", "transaction_date", "available_balance", "balance"]:
+            if re.search(r"\b(breakdown by|group by|compare by|by|with respect to each|each)\s+" + re.escape(col_clean) + r"\b", lower) or \
+               re.search(r"\b(breakdown by|group by|compare by|by|with respect to each|each)\s+" + re.escape(col) + r"\b", lower):
+                if col in ["entity_id", "entity", "company", "bank"]:
+                    if "bank_name" not in group_by:
+                        group_by.append("bank_name")
+                elif col not in group_by and col not in ["transaction_amount", "amount", "transaction_date", "available_balance", "balance"]:
                     group_by.append(col)
 
-        # 4. If single value matched and not grouped on that column, add as filter
+        # 4. Detect directionality (spend/debit vs receive/credit)
+        is_debit = any(re.search(r"\b" + re.escape(w) + r"\b", lower) for w in ["spend", "spent", "spending", "paid", "debit", "debits", "payment", "payments"])
+        is_credit = any(re.search(r"\b" + re.escape(w) + r"\b", lower) for w in ["receive", "received", "credit", "credits", "deposit", "deposits", "inflow", "inflows"])
+        if is_debit and not is_credit and "transaction_type" not in group_by:
+            if not any(f.get("field") == "transaction_type" for f in filters):
+                filters.append({"field": "transaction_type", "operator": "eq", "value": "debit"})
+        elif is_credit and not is_debit and "transaction_type" not in group_by:
+            if not any(f.get("field") == "transaction_type" for f in filters):
+                filters.append({"field": "transaction_type", "operator": "eq", "value": "credit"})
+
+        # 5. Detect numeric thresholds & negative balance
+        num_match = re.search(r"\b(?:more than|over|greater than|>)\s*[₹$]?\s*([\d,]+)", lower)
+        if num_match:
+            val_num = float(num_match.group(1).replace(",", ""))
+            filters.append({"field": "transaction_amount", "operator": "gt", "value": val_num})
+
+        if "negative balance" in lower:
+            filters.append({"field": "available_balance", "operator": "lt", "value": 0.0})
+
+        # 6. Detect description keyword / payee / merchant
+        query_text = prompt.split("Current User Query:")[-1].strip().strip("'\"") if "Current User Query:" in prompt else prompt
+        quoted_strings = re.findall(r"['\"]([^'\"]+)['\"]", query_text)
+        for q in quoted_strings:
+            q_clean = q.strip().lower()
+            if len(q_clean.split()) <= 4 and not any(q_clean in b.lower() for b in getattr(entity_resolver, "banks", [])):
+                filters.append({"field": "description", "operator": "like", "value": q.strip()})
+
+        if not any(f.get("field") == "description" for f in filters):
+            desc_match = re.search(r"\b(?:on|paid to|payments? made to|pay(?:ing| anything)? to)\s+([a-zA-Z0-9_-]+)", lower)
+            if not desc_match:
+                desc_match = re.search(r"\b(?:what is the|the)\s+([a-zA-Z0-9_-]+)\s+(?:paid|payment|spent|received)", lower)
+            if desc_match:
+                kw = desc_match.group(1).strip()
+                stopwords = ["this", "that", "last", "next", "our", "all", "each", "the", "a", "an", "vendor", "vendors", "account", "accounts", "bank", "banks", "me", "amount", "total", "spend", "balance", "overall"]
+                if kw not in stopwords and not any(kw == b.lower() for b in getattr(entity_resolver, "banks", [])):
+                    filters.append({"field": "description", "operator": "like", "value": kw})
+
+        # 7. If single categorical value matched from dynamic schema registry and not grouped, add as filter
         for col, val_list in matched_cols_to_vals.items():
             if col not in group_by:
                 for v_item in val_list:
                     if not any(f.get("field") == col for f in filters):
                         filters.append({"field": col, "operator": "eq", "value": v_item["canonical"]})
 
-        # 5. Detect target domain dynamically based on query intent
-        if any(w in lower for w in ["balance", "balances", "available balance", "account balance"]):
+        # 8. Detect target domain dynamically based on query intent
+        if any(w in lower for w in ["balance", "balances", "available balance", "account balance", "negative balance"]):
             target_domain = "accounts"
-            target_metric = "available_balance"
+            target_metric = "records_list" if any(w in lower for w in ["which", "list", "show"]) else "available_balance"
         elif any(f.get("field") == "transaction_reference_id" for f in filters):
             target_domain = "transactions"
             target_metric = "records_list"
         else:
             target_domain = "transactions"
-            target_metric = "total_amount" if group_by else ("records_list" if any(w in lower for w in ["who paid", "show", "list", "which", "lookup"]) and not any(w in lower for w in ["how much", "what amount", "total", "spend"]) else "total_amount")
+            is_list = any(w in lower for w in ["who paid", "show me", "list", "which", "lookup", "unusually high", "large payouts"])
+            is_agg = any(w in lower for w in ["how much", "what amount", "total", "spend", "payment made", "combined"])
+            target_metric = "total_amount" if (group_by or (is_agg and not is_list)) else ("records_list" if is_list else "total_amount")
 
-        # 6. Date Range handling
+        # 9. Generalized Date Range handling
         date_range = None
         if "start_date" in prompt:
             m_start = re.search(r'"start_date":\s*"([^"]+)"', prompt)
@@ -185,23 +243,54 @@ class MockLLMClient(BaseLLMClient):
 
         if not date_range and target_domain == "transactions":
             try:
-                a_dt = datetime.strptime(anchor, "%Y-%m-%d")
-                if "last month" in lower:
-                    first_cur = a_dt.replace(day=1)
-                    last_prev = first_cur - timedelta(days=1)
-                    first_prev = last_prev.replace(day=1)
-                    date_range = {
-                        "start_date": first_prev.strftime("%Y-%m-%d"),
-                        "end_date": last_prev.strftime("%Y-%m-%d")
-                    }
-                elif "june 2026" in lower:
-                    date_range = {"start_date": "2026-06-01", "end_date": "2026-06-30"}
-                elif "may 2026" in lower:
-                    date_range = {"start_date": "2026-05-01", "end_date": "2026-05-31"}
-                elif "2026" in lower:
-                    date_range = {"start_date": "2026-01-01", "end_date": "2026-12-31"}
-                elif "2025" in lower:
-                    date_range = {"start_date": "2025-01-01", "end_date": "2025-12-31"}
+                # A. Specific date "month day, year" (e.g. "February 29, 2024", "May 20, 2026")
+                exact_match = re.search(r"\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2}),\s*(\d{4})\b", lower)
+                if exact_match:
+                    m_n, d_s, y_s = exact_match.groups()
+                    dt_parsed = datetime.strptime(f"{m_n} {d_s} {y_s}", "%B %d %Y")
+                    iso_d = dt_parsed.strftime("%Y-%m-%d")
+                    date_range = {"start_date": iso_d, "end_date": iso_d}
+
+                # B. Holiday range: Christmas to New Year's Eve
+                elif "christmas" in lower and "new year" in lower:
+                    y_m = re.search(r"\b(20\d{2})\b", lower)
+                    yr = y_m.group(1) if y_m else "2025"
+                    date_range = {"start_date": f"{yr}-12-25", "end_date": f"{yr}-12-31"}
+
+                # C. Month Year (e.g. "jan 2024", "december 2025", "june 2026")
+                elif re.search(r"\b(jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|september|oct|october|nov|november|dec|december)\s+(\d{4})\b", lower):
+                    m_prefix, yr = re.search(r"\b(jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|september|oct|october|nov|november|dec|december)\s+(\d{4})\b", lower).groups()
+                    for m_idx in range(1, 13):
+                        m_full = datetime(int(yr), m_idx, 1).strftime("%B").lower()
+                        if m_full.startswith(m_prefix):
+                            f_day = datetime(int(yr), m_idx, 1)
+                            l_day = datetime(int(yr), 12, 31) if m_idx == 12 else (datetime(int(yr), m_idx + 1, 1) - timedelta(days=1))
+                            date_range = {"start_date": f_day.strftime("%Y-%m-%d"), "end_date": l_day.strftime("%Y-%m-%d")}
+                            break
+
+                # D. Relative expressions based on anchor date
+                else:
+                    a_dt = datetime.strptime(anchor, "%Y-%m-%d")
+                    if "this month" in lower:
+                        first_cur = a_dt.replace(day=1)
+                        next_m = (first_cur.replace(day=28) + timedelta(days=4)).replace(day=1)
+                        last_cur = next_m - timedelta(days=1)
+                        date_range = {"start_date": first_cur.strftime("%Y-%m-%d"), "end_date": last_cur.strftime("%Y-%m-%d")}
+                    elif "last month" in lower:
+                        first_cur = a_dt.replace(day=1)
+                        last_prev = first_cur - timedelta(days=1)
+                        first_prev = last_prev.replace(day=1)
+                        date_range = {"start_date": first_prev.strftime("%Y-%m-%d"), "end_date": last_prev.strftime("%Y-%m-%d")}
+                    elif re.search(r"\blast\s+(\d+|three|six)\s+months\b", lower):
+                        m_cnt_str = re.search(r"\blast\s+(\d+|three|six)\s+months\b", lower).group(1)
+                        m_map = {"three": 3, "six": 6}
+                        n_months = m_map.get(m_cnt_str, int(m_cnt_str) if m_cnt_str.isdigit() else 3)
+                        start_prev = a_dt - timedelta(days=n_months * 30)
+                        date_range = {"start_date": start_prev.strftime("%Y-%m-%d"), "end_date": a_dt.strftime("%Y-%m-%d")}
+                    elif "this year" in lower or re.search(r"\b(20\d{2})\b", lower):
+                        y_m = re.search(r"\b(20\d{2})\b", lower)
+                        yr = y_m.group(1) if y_m else a_dt.strftime("%Y")
+                        date_range = {"start_date": f"{yr}-01-01", "end_date": f"{yr}-12-31"}
             except Exception:
                 pass
 
@@ -251,19 +340,41 @@ class LLMAdapter:
             f"{json.dumps(schema_profile, indent=2)}\n\n"
             "SCHEMA-DRIVEN REASONING & MULTI-TURN PRINCIPLES:\n"
             "1. TARGET DOMAINS:\n"
-            "   - 'transactions': for payments, inflows, outflows, debits, credits, transfers, transaction dates, or reference ID lookups.\n"
-            "   - 'accounts': for available balances, account lists, program IDs, or entity balances.\n"
+            "   - 'transactions': for payments, inflows, outflows, debits, credits, transfers, transaction dates, descriptions, or reference ID lookups.\n"
+            "   - 'accounts': for available balances, account lists, program IDs, or negative balance checks.\n"
             "   - 'banks': for high-level bank totals across accounts.\n"
-            "2. GROUPING & MULTI-VALUE COMPARISONS:\n"
-            "   - When the user asks for amounts across credit vs debit (e.g. 'credit vs debit', 'how much was credited and debited'), "
-            "set group_by to [\"transaction_type\"] and target_metric to \"total_amount\".\n"
-            "   - When the user asks for amounts or balances by bank, set group_by to [\"bank_name\"].\n"
+            "2. DIRECTIONALITY & TRANSACTION TYPES:\n"
+            "   - For spending, payments, expenses, debits, or outflows: add entity_filter {\"field\": \"transaction_type\", \"operator\": \"eq\", \"value\": \"debit\"}.\n"
+            "   - For received money, inflows, credits, or deposits: add entity_filter {\"field\": \"transaction_type\", \"operator\": \"eq\", \"value\": \"credit\"}.\n"
+            "   - When comparing credit vs debit (e.g. 'credit and debit', 'credited vs debited'): DO NOT filter on transaction_type. Set group_by to [\"transaction_type\"] and target_metric to \"total_amount\" so both types are returned.\n"
+            "3. GROUPING & BREAKDOWNS:\n"
+            "   - When the user asks for amounts or balances by company, vendor, partner, entity, or bank (e.g. 'with respect to each company', 'by company', 'by bank'), ALWAYS set group_by to [\"bank_name\"].\n"
+            "   - NEVER group by 'entity_id'. 'entity_id' is an internal raw UUID foreign key. Companies are represented by 'bank_name' (e.g. 'HDFC BANK LIMITED').\n"
             "   - When comparing across programs, set group_by to [\"program_id\"].\n"
-            "3. BALANCE QUERIES: When the user inquires about available balance, set target_domain to 'accounts' and target_metric to 'available_balance'.\n"
-            "4. SENSITIVE DATA MASKING: Never expose unmasked raw account numbers. Accounts are referenced by masked number (e.g. ending in 9069).\n"
-            "5. REFERENCE ID SEARCH: If the user provides a reference receipt number (e.g. '1715499972'), add an entity_filter on 'transaction_reference_id'.\n"
-            "6. MULTI-TURN CONTEXT: Inherit previous turn's date_range and bank filters when user asks follow-up questions in the same session.\n"
-            "7. ALL ENTITIES / GLOBAL SCOPE: If user asks for 'all entities', 'all banks', or 'across all', do not filter on a single bank.\n\n"
+            "   - For spending trends over time ('spend trend', 'trend over last X months'): set group_by to [\"month\"].\n"
+            "4. KEYWORD & PAYEE MATCHING (DESCRIPTION COLUMN):\n"
+            "   - When the user asks about a specific merchant, person, category, or payee (e.g. 'Swiggy', 'Paresh', 'subscriptions', 'GST', 'Selection Mobile', 'Selection Electronics') that is not a canonical bank name, filter on 'description' with operator 'like':\n"
+            "     {\"field\": \"description\", \"operator\": \"like\", \"value\": \"<keyword>\"}.\n"
+            "   - CRITICAL: ONLY filter on 'description' when an explicit merchant or payee name is mentioned. If NO specific merchant or payee is mentioned (e.g. 'How much was credited vs debited', 'How much did I spend this month?'), DO NOT add any filter on 'description'. NEVER put the full user question or query into 'description'.\n"
+            "5. NUMERIC THRESHOLDS & ACCOUNT BALANCE FILTERS:\n"
+            "   - When filtering by transaction amount (e.g. 'spend more than 10000', 'transactions over 200,000 INR'): add entity_filter {\"field\": \"transaction_amount\", \"operator\": \"gt\", \"value\": <number>}.\n"
+            "   - For accounts with negative balance ('negative balance'): set target_domain to 'accounts', target_metric to 'records_list', and add filter {\"field\": \"available_balance\", \"operator\": \"lt\", \"value\": 0}.\n"
+            "   - When the user inquires about available balance, set target_domain to 'accounts' and target_metric to 'available_balance'.\n"
+            "6. TEMPORAL & CALENDAR EXPRESSIONS (Anchor: " + str(anchor) + "):\n"
+            "   - 'this month': start of current month to end of current month.\n"
+            "   - 'last month': start of previous month to end of previous month.\n"
+            "   - 'last 3 months' / 'last 6 months': N months prior to anchor date to anchor date.\n"
+            "   - Exact date (e.g. 'February 29, 2024'): set start_date and end_date to '2024-02-29'.\n"
+            "   - Month-Year (e.g. 'Jan 2024', 'December 2025'): set start_date to 1st and end_date to last day of that month.\n"
+            "   - Holiday intervals (e.g. 'Christmas and New Year\\'s Eve of 2025'): set start_date to '2025-12-25', end_date to '2025-12-31'.\n"
+            "   - Specific year (e.g. 'year 2020', 'this year'): 'YYYY-01-01' to 'YYYY-12-31'.\n"
+            "7. RECORD LISTINGS & REFERENCE LOOKUPS:\n"
+            "   - When the user asks to 'list', 'show all', 'which accounts', or lookup records, set target_metric to 'records_list'.\n"
+            "   - If the user provides a reference receipt number (e.g. '1715499972'), add an entity_filter on 'transaction_reference_id'.\n"
+            "8. SENSITIVE DATA MASKING & MULTI-TURN:\n"
+            "   - Never expose unmasked raw account numbers. Accounts are referenced by masked number (e.g. ending in 9069).\n"
+            "   - Inherit previous turn's date_range and bank filters when user asks follow-up questions in the same session.\n"
+            "   - If user asks for 'all entities', 'all banks', or 'across all', do not filter on a single bank.\n\n"
             "Output valid JSON ONLY matching the FinancialQueryAST schema:\n"
             "{\n"
             "  \"target_domain\": \"transactions\" | \"accounts\" | \"banks\",\n"
@@ -299,12 +410,25 @@ class LLMAdapter:
             match = re.search(r'\{.*\}', raw_output, re.DOTALL)
             json_str = match.group(0) if match else raw_output
             parsed = json.loads(json_str)
+            if "query" in parsed and isinstance(parsed["query"], dict):
+                parsed = parsed["query"]
+            elif "ast" in parsed and isinstance(parsed["ast"], dict):
+                parsed = parsed["ast"]
+
+            # Map filter date boundaries if LLM returned filter: {transaction_date: {gte, lte}}
+            if not parsed.get("date_range") and "filter" in parsed and isinstance(parsed["filter"], dict):
+                f_date = parsed["filter"].get("transaction_date", {})
+                if isinstance(f_date, dict):
+                    parsed["date_range"] = {
+                        "start_date": f_date.get("gte") or f_date.get("gt"),
+                        "end_date": f_date.get("lte") or f_date.get("lt")
+                    }
 
             # Check if query is global across all entities
             is_global_q = bool(re.search(
-                r"\b(all entities|all vendors|all companies|all accounts|every vendor|across all|select all|for all entities|for all vendors|for all companies|for all|all of them|everyone)\b",
+                r"\b(all entities|all vendors|all companies|every vendor|across all entities|across all banks|select all|for all entities|for all vendors|for all companies|everyone)\b",
                 query.lower()
-            ))
+            )) and not resolved_vendor
 
             # Ensure resolved vendor is present in filters if provided and query is not global
             if is_global_q:
@@ -320,6 +444,33 @@ class LLMAdapter:
             if last_ast and not parsed.get("date_range") and last_ast.get("date_range"):
                 if not any(w in query.lower() for w in ["all time", "ever", "entire", "history", "all years"]):
                     parsed["date_range"] = last_ast["date_range"]
+
+            # Sanitize description filters: ensure full user question was not mistakenly put as description keyword
+            if parsed.get("entity_filters"):
+                cleaned_filters = []
+                for f in parsed["entity_filters"]:
+                    if f.get("field") == "description":
+                        val_str = str(f.get("value", "")).strip().lower()
+                        # If description filter equals entire query or contains question phrases, discard it
+                        if (val_str in query.lower() and len(val_str.split()) > 3) or any(w in val_str for w in ["how much", "what is", "how many", "tell me", "credited vs debited"]):
+                            continue
+                    cleaned_filters.append(f)
+                parsed["entity_filters"] = cleaned_filters
+
+            # Group-by sanitization: Map entity_id, entity, company, vendor to bank_name
+            if parsed.get("group_by"):
+                sanitized_gb = []
+                for g in parsed["group_by"]:
+                    g_clean = str(g).lower().strip()
+                    if g_clean in ["company", "companies", "entity", "entities", "entity_id", "vendor", "partner", "bank"]:
+                        sanitized_gb.append("bank_name")
+                    else:
+                        sanitized_gb.append(g)
+                parsed["group_by"] = list(dict.fromkeys(sanitized_gb))
+
+            # If user wants a breakdown by transaction_type, do not restrict to only debit or only credit
+            if "transaction_type" in parsed.get("group_by", []):
+                parsed["entity_filters"] = [f for f in parsed.get("entity_filters", []) if f.get("field") != "transaction_type"]
 
             # Universal Group-By Auto-Inference: If multiple values of the same column were filtered, ensure group_by
             if not parsed.get("group_by"):
@@ -356,27 +507,125 @@ class LLMAdapter:
         breakdown_items: Optional[List[Dict[str, Any]]] = None,
         resolved_vendor: Optional[str] = None
     ) -> str:
-        """Generates grounded narrative without performing any arithmetic."""
+        """Invokes LLM (e.g. Bedrock) to generate a grounded natural language narrative from PostgreSQL facts."""
+        from backend.engine.db import db
+
+        # 1. Dynamic LLM Prompting: Bedrock / LLM decides the text based on grounded facts
+        if not isinstance(self.client, MockLLMClient):
+            try:
+                cur_anchor = db.get_anchor_date()
+                max_db_dt = db.get_max_dataset_date()
+
+                system_prompt = (
+                    "You are the executive FinOps AI Assistant for TBX Banking & Treasury.\n"
+                    "Your goal is to write a clear, professional natural language narrative answering the user's financial question based ONLY on the grounded database facts provided below.\n\n"
+                    "CRITICAL PRINCIPLES:\n"
+                    "1. ZERO MATH: All numbers, balances, totals, counts, and averages provided are exact and pre-computed by PostgreSQL. Use them exactly as given. Do NOT attempt to calculate, sum, subtract, or re-estimate any numbers.\n"
+                    "2. ACCURATE ENTITY NAMES: Use the exact company or bank name from the database (e.g. 'HDFC BANK LIMITED', 'AXIS BANK LIMITED'). Never output internal UUIDs.\n"
+                    "3. STRUCTURE & FORMATTING:\n"
+                    "   - For multi-entity or multi-category breakdowns, format them cleanly with bullet points:\n"
+                    "     • **[Bank/Company/Category Name]**: **$[Amount]** ([Count] accounts/transactions)\n"
+                    "   - Conclude with the Total Available Balance or Total Amount in bold.\n"
+                    "   - If the user asks about a time period (e.g. 'last month') that has no records because the database only has data up to an earlier date, explain clearly: state the current machine date, what month was requested, the latest date available in the database, and that no transactions exist for that period.\n"
+                    "4. SCOPE & EDGE CASES:\n"
+                    "   - If the user asks to forecast future spend or predict upcoming disbursements ('next month', 'who will receive the most'), explain clearly that the system queries historical verified transactions and does not perform speculative future forecasting.\n"
+                    "   - If the user asks for physical PDF invoices or receipt files, explain that transactional metadata, reference IDs, and ledger amounts are available, but raw PDF document scans are not stored in the transactional ledger.\n"
+                    "   - If the user asks about a merchant or category with 0 records, state that no records match in the current dataset and suggest available active categories/banks.\n"
+                    "5. TONE: Direct, professional, concise, executive-grade. Avoid conversational fluff."
+                )
+
+                facts = []
+                facts.append(f"User Query: \"{query}\"")
+                facts.append(f"Current System Date (Machine Time): {cur_anchor}")
+                facts.append(f"Latest Recorded Transaction in Database: {max_db_dt}")
+
+                if resolved_vendor:
+                    facts.append(f"Target Entity: {resolved_vendor}")
+
+                if metrics:
+                    if "total_amount" in metrics:
+                        facts.append(f"Pre-Calculated Total: ${float(metrics['total_amount']):,.2f}")
+                    if "record_count" in metrics:
+                        facts.append(f"Pre-Calculated Count: {metrics['record_count']}")
+                    if "average_amount" in metrics:
+                        facts.append(f"Pre-Calculated Average: ${float(metrics['average_amount']):,.2f}")
+
+                if breakdown_items:
+                    breakdown_lines = []
+                    for itm in breakdown_items:
+                        name = itm.get("name", "")
+                        amt = itm.get("amount", 0.0)
+                        cnt = itm.get("count", 0)
+                        breakdown_lines.append(f"  * {name}: ${amt:,.2f} ({cnt} records)")
+                    facts.append("Breakdown Items:\n" + "\n".join(breakdown_lines))
+
+                if sample_rows and len(sample_rows) == 1:
+                    row = sample_rows[0]
+                    facts.append(f"Single Matching Transaction: {json.dumps(row, default=str)}")
+
+                if anomaly and anomaly.detected:
+                    facts.append(f"Statistical Anomaly Detected: {anomaly.message}")
+
+                user_prompt = "GROUNDED DATABASE FACTS:\n" + "\n".join(facts) + "\n\nPlease write the natural language response to the user:"
+                llm_response = self.client.complete(user_prompt, system_prompt).strip()
+                if llm_response and len(llm_response) > 10:
+                    return llm_response
+            except Exception:
+                pass  # Fall back to deterministic fallback below
+
+        # 2. Deterministic Fallback Synthesizer (for MockLLMClient and offline testing)
         parts = []
+        is_balance_q = any(w in query.lower() for w in ["balance", "balances", "available balance", "account balance"])
 
         if breakdown_items and len(breakdown_items) > 0:
-            prefix = f"For **{resolved_vendor}**, " if resolved_vendor else ""
-            item_descriptions = []
-            for item in breakdown_items:
-                name = item.get("name", "")
-                amt = item.get("amount", 0.0)
-                cnt = item.get("count", 0)
-                cnt_str = f" ({cnt} record{'s' if cnt != 1 else ''})" if cnt else ""
-                item_descriptions.append(f"**${amt:,.2f}** is **{name}**{cnt_str}")
+            is_credit_debit = all(item.get("name", "").upper() in ["CREDIT", "DEBIT"] for item in breakdown_items)
+
+            if is_balance_q:
+                category_noun = "company"
+                unit_noun = "account"
+                total_title = "Total Available Balance"
+            elif is_credit_debit:
+                category_noun = "transaction type"
+                unit_noun = "transaction"
+                total_title = "Total Volume"
+            else:
+                category_noun = "category"
+                unit_noun = "record"
+                total_title = "Total Amount"
 
             total = metrics.get("total_amount")
-            total_str = f", totaling **${float(total):,.2f}**" if total is not None and len(breakdown_items) > 1 else ""
-            parts.append(f"{prefix}" + " and ".join(item_descriptions) + f"{total_str}.")
+            total_records = sum(item.get("count", 0) for item in breakdown_items)
+
+            if len(breakdown_items) <= 2 and is_credit_debit:
+                parts_cd = []
+                for item in breakdown_items:
+                    name = item.get("name", "").upper()
+                    amt = item.get("amount", 0.0)
+                    cnt = item.get("count", 0)
+                    parts_cd.append(f"**${amt:,.2f}** in {name.title()} ({cnt:,} transactions)")
+                summary_lead = f"For **{resolved_vendor}**, " if resolved_vendor else ""
+                total_str = f", totaling **${float(total):,.2f}**" if total is not None else ""
+                parts.append(f"{summary_lead}Breakdown: " + " and ".join(parts_cd) + f"{total_str}.")
+            else:
+                lead = f"Here is the balance breakdown by {category_noun}:" if is_balance_q else f"Here is the breakdown by {category_noun}:"
+                if resolved_vendor:
+                    lead = f"Here is the breakdown for **{resolved_vendor}**:"
+
+                bullets = []
+                for item in breakdown_items:
+                    name = item.get("name", "").strip()
+                    amt = item.get("amount", 0.0)
+                    cnt = item.get("count", 0)
+                    cnt_str = f" ({cnt} {unit_noun}{'s' if cnt != 1 else ''})" if cnt else ""
+                    bullets.append(f"• **{name}**: **${amt:,.2f}**{cnt_str}")
+
+                bullets_str = "\n".join(bullets)
+                total_str = f"\n\n**{total_title}**: **${float(total):,.2f}** across {total_records} {unit_noun}{'s' if total_records != 1 else ''}." if total is not None else ""
+                parts.append(f"{lead}\n{bullets_str}{total_str}")
         else:
             total = metrics.get("total_amount")
             count = metrics.get("record_count")
             avg = metrics.get("average_amount")
-            is_balance_q = any(w in query.lower() for w in ["balance", "balances", "available balance", "account balance"])
 
             if len(sample_rows) == 1 and any(w in query.lower() for w in ["reference", "receipt", "lookup", "ref"]):
                 row = sample_rows[0]
@@ -403,5 +652,96 @@ class LLMAdapter:
             parts.append(f"⚠️ **Anomaly Alert:** {anomaly.message}")
 
         return " ".join(parts)
+
+    def synthesize_clarification(
+        self,
+        query: str,
+        resolved_vendor: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        options: Optional[List[str]] = None,
+        cur_anchor: Optional[str] = None,
+        max_db_dt: Optional[str] = None,
+        row_count: int = 0
+    ) -> str:
+        from backend.engine.db import db
+        from datetime import datetime
+
+        cur_anchor = cur_anchor or db.get_anchor_date()
+        max_db_dt = max_db_dt or db.get_max_dataset_date()
+        active_options = options or db.get_distinct_entities().get("banks", [])[:4]
+
+        # 1. Live LLM (Bedrock / Groq / Ollama) Prompting:
+        if not isinstance(self.client, MockLLMClient):
+            try:
+                system_prompt = (
+                    "You are an elite, executive-level Financial AI Agent. "
+                    "The user's query could not be answered with direct records (e.g. 0 records found, future forecast requested, missing category, or unverified entity).\n"
+                    "Your job is to provide a helpful, factual, concise executive clarification based on the ground facts below.\n\n"
+                    "BUSINESS GUIDELINES:\n"
+                    "1. FUTURE OR FORECASTING: If the query asks about future periods ('next month', 'who will receive the most'), explain that the system verifies historical ledger records and does not perform speculative future forecasting.\n"
+                    "2. DATE RANGE EXCEEDS DATASET: If the requested date is after the latest ledger record in the dataset (latest DB date is Z, current machine date is X), explain clearly that while the current machine date is X and the query requested Y, recorded database transactions only extend up to Z.\n"
+                    "3. MISSING CATEGORY / 0 RECORDS: If the category, vendor, or merchant has 0 matching transactions, state that no records were found matching those filters, and suggest checking available active entities.\n"
+                    "4. UNVERIFIED ENTITY: If the entity was ambiguous, ask the user to clarify from the available active options.\n"
+                    "5. PHYSICAL INVOICES: If the user asks for PDF documents or scanned receipts, clarify that transaction reference IDs and metadata are recorded, but raw PDF document scans are not stored in the transactional ledger.\n"
+                    "6. TONE: Direct, professional, polite, concise. Do NOT make up fake transaction data."
+                )
+
+                facts = []
+                facts.append(f"User Query: \"{query}\"")
+                facts.append(f"Current System Date (Machine Time): {cur_anchor}")
+                facts.append(f"Latest Recorded Transaction in Database: {max_db_dt}")
+                if resolved_vendor:
+                    facts.append(f"Target Entity: {resolved_vendor}")
+                if start_date:
+                    facts.append(f"Requested Date Range: {start_date} to {end_date or start_date}")
+                facts.append(f"Matching Records Found: {row_count}")
+                if active_options:
+                    facts.append(f"Available Active Entities/Banks: {', '.join(active_options[:4])}")
+
+                user_prompt = "GROUNDED SYSTEM FACTS:\n" + "\n".join(facts) + "\n\nPlease write the executive clarification:"
+                llm_response = self.client.complete(user_prompt, system_prompt).strip()
+                if llm_response and len(llm_response) > 10:
+                    return llm_response
+            except Exception:
+                pass
+
+        # 2. Generalized Deterministic Fallback (for MockLLMClient and offline testing)
+        try:
+            cur_dt_obj = datetime.strptime(cur_anchor, "%Y-%m-%d")
+            cur_dt_str = cur_dt_obj.strftime("%B %d, %Y")
+            max_dt_str = datetime.strptime(max_db_dt, "%Y-%m-%d").strftime("%B %d, %Y")
+            req_month_str = datetime.strptime(start_date, "%Y-%m-%d").strftime("%B %Y") if start_date else None
+        except Exception:
+            cur_dt_str = cur_anchor
+            max_dt_str = max_db_dt
+            req_month_str = start_date
+
+        if start_date and start_date > max_db_dt:
+            if resolved_vendor:
+                return (
+                    f"No financial transactions exist for **'{resolved_vendor}'** in **{req_month_str}**. "
+                    f"The current system date is **{cur_dt_str}**, but our database records only extend up to **{max_dt_str}**."
+                )
+            else:
+                return (
+                    f"Your query asks about **{req_month_str}**, but our database records only extend up to **{max_dt_str}** "
+                    f"(current system date is **{cur_dt_str}**). No transactions exist for {req_month_str}."
+                )
+        elif resolved_vendor:
+            return (
+                f"No financial records were found for **'{resolved_vendor}'** matching your specified filters. "
+                f"Please verify the date range or check one of our active entities: {', '.join(active_options[:4])}."
+            )
+        elif active_options:
+            return (
+                f"We couldn't clearly identify the bank, account, or program in your question. "
+                f"Did you mean one of these: **{', '.join(active_options[:4])}**?"
+            )
+        else:
+            return (
+                "We could not locate data matching your query in the current financial datasets. "
+                "Please refine your query or ask about bank accounts, balances, transactions, or reference IDs."
+            )
 
 llm_adapter = LLMAdapter()

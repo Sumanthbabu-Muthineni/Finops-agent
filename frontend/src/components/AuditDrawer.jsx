@@ -49,7 +49,7 @@ export const AuditDrawer = ({ auditTrail, confidence }) => {
           </div>
 
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
-            <span style={{ fontSize: '0.75rem', color: '#94a3b8' }}>DuckDB ANSI-SQL Query:</span>
+            <span style={{ fontSize: '0.75rem', color: '#94a3b8' }}>PostgreSQL ANSI-SQL Query:</span>
             <button 
               onClick={handleCopy} 
               style={{
