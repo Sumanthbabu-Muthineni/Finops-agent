@@ -52,7 +52,13 @@ resource "aws_ecs_task_definition" "backend" {
         { name = "BEDROCK_MODEL_ID", value = "us.meta.llama3-1-8b-instruct-v1:0" },
         { name = "DATA_DIR", value = "data" },
         { name = "CORS_ORIGINS", value = "*" },
-        { name = "DEBUG", value = "false" }
+        { name = "DEBUG", value = "false" },
+        { name = "DB_ENGINE", value = "mysql" },
+        { name = "MYSQL_HOST", value = aws_db_instance.mysql.address },
+        { name = "MYSQL_PORT", value = "3306" },
+        { name = "MYSQL_DB", value = var.db_name },
+        { name = "MYSQL_USER", value = var.db_user },
+        { name = "MYSQL_PASSWORD", value = var.db_password }
       ]
 
       logConfiguration = {

@@ -1,28 +1,42 @@
 """
-TBX FinOps Assistant - Universal Dynamic Database Engine (MySQL 8.0 Native)
-High-performance connection-pooled execution engine supporting 10M-80M rows scale
-with B-Tree indexed execution, zero hardcoded schemas, dynamic information_schema
-introspection, foreign key relationship extraction, and sensitive data masking.
+TBX FinOps Assistant - Multi-Tenant Relational Database Engine (MySQL 8.0 Native)
+Provides thread-safe connection pooling, session-scoped tenant isolation (BYODB),
+zero-DDL index and schema introspection, and read-only enforcement.
 """
 
 import time
-import re
+import os
 import queue
 import threading
+from typing import Dict, Any, List, Optional, Tuple, Set
 from datetime import datetime
-from typing import Tuple, List, Dict, Any, Optional, Set
 import pandas as pd
+import pymysql
+
 from backend.config import settings
 from backend.core.masking import mask_records_dataframe
 
 class PyMySQLConnectionPool:
     """Thread-safe high-throughput connection pool for MySQL 8.0."""
-    def __init__(self, host: str, port: int, user: str, password: str, db: str, minconn: int = 2, maxconn: int = 20):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        user: str,
+        password: str,
+        db: str,
+        minconn: int = 2,
+        maxconn: int = 20,
+        read_only: bool = False,
+        use_ssl: bool = False
+    ):
         self.host = host
         self.port = int(port)
         self.user = user
         self.password = password
         self.db = db
+        self.read_only = read_only
+        self.use_ssl = use_ssl
         self.maxconn = max(maxconn, minconn)
         self._pool = queue.Queue(maxsize=self.maxconn)
         self._lock = threading.Lock()
@@ -35,12 +49,12 @@ class PyMySQLConnectionPool:
                 self._pool.put_nowait(conn)
                 self._created += 1
             except Exception as e:
-                print(f"⚠️ Warning during initial MySQL connection creation: {e}")
+                print(f"⚠️ Warning during initial MySQL connection creation ({self.host}:{self.port}/{self.db}): {e}")
                 break
 
     def _create_conn(self):
-        import pymysql
-        return pymysql.connect(
+        ssl_config = {"ssl": {"ssl_mode": "REQUIRED"}} if self.use_ssl else None
+        conn = pymysql.connect(
             host=self.host,
             port=self.port,
             user=self.user,
@@ -49,42 +63,52 @@ class PyMySQLConnectionPool:
             connect_timeout=10,
             read_timeout=120,
             write_timeout=120,
-            autocommit=True
+            autocommit=True,
+            **(ssl_config if ssl_config else {})
         )
+        if self.read_only:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SET SESSION TRANSACTION READ ONLY;")
+            except Exception:
+                pass
+        return conn
 
     def getconn(self):
         try:
             conn = self._pool.get_nowait()
             try:
-                conn.ping(reconnect=True)
+                conn.ping()
             except Exception:
                 conn = self._create_conn()
             return conn
         except queue.Empty:
             with self._lock:
                 if self._created < self.maxconn:
-                    conn = self._create_conn()
                     self._created += 1
-                    return conn
-            # Pool is at capacity, wait up to 15 seconds
-            conn = self._pool.get(timeout=15)
-            try:
-                conn.ping(reconnect=True)
-            except Exception:
-                conn = self._create_conn()
-            return conn
+                    return self._create_conn()
+            return self._pool.get(timeout=10.0)
 
     def putconn(self, conn):
-        if conn:
+        try:
+            self._pool.put_nowait(conn)
+        except queue.Full:
             try:
-                self._pool.put_nowait(conn)
-            except queue.Full:
+                conn.close()
+            except Exception:
+                pass
+            with self._lock:
+                self._created -= 1
+
+    def close_all(self):
+        with self._lock:
+            while not self._pool.empty():
                 try:
+                    conn = self._pool.get_nowait()
                     conn.close()
                 except Exception:
                     pass
-                with self._lock:
-                    self._created -= 1
+            self._created = 0
 
 
 class DatabaseManager:
@@ -101,17 +125,24 @@ class DatabaseManager:
         return True
 
     def _init_db(self):
-        self._cached_schema_profile = None
-        self._cached_value_map = None
-        self._cached_distinct_entities = None
-        self._cached_anchor_date = None
-        self._cached_max_dataset_date = None
-        self._cached_foreign_keys = None
-        self._cached_tables = None
-        self._existing_views = None
+        # Default system database pool (Demo database)
+        self.default_pool = None
+        self._tenant_pools: Dict[str, PyMySQLConnectionPool] = {}
+        self._tenant_configs: Dict[str, Dict[str, Any]] = {}
+        self._tenant_advisors: Dict[str, Dict[str, Any]] = {}
+
+        # Session-aware caches
+        self._cached_schema_profiles: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self._cached_indexes_map: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+        self._cached_foreign_keys_map: Dict[str, List[Dict[str, str]]] = {}
+        self._cached_tables_map: Dict[str, Dict[str, str]] = {}
+        self._cached_distinct_entities_map: Dict[str, Dict[str, List[Any]]] = {}
+        self._cached_value_maps: Dict[str, Dict[str, List[Dict[str, str]]]] = {}
+        self._cached_max_dates: Dict[str, str] = {}
+        self._existing_views_map: Dict[str, Set[str]] = {}
 
         try:
-            self.pool = PyMySQLConnectionPool(
+            self.default_pool = PyMySQLConnectionPool(
                 host=settings.MYSQL_HOST,
                 port=settings.MYSQL_PORT,
                 user=settings.MYSQL_USER,
@@ -120,59 +151,247 @@ class DatabaseManager:
                 minconn=getattr(settings, "DB_POOL_MIN", 2),
                 maxconn=getattr(settings, "DB_POOL_MAX", 20)
             )
-            print(f"✅ Connected to MySQL Database at {settings.MYSQL_HOST}:{settings.MYSQL_PORT}/{settings.MYSQL_DB}")
+            print(f"✅ Connected to Default MySQL Database at {settings.MYSQL_HOST}:{settings.MYSQL_PORT}/{settings.MYSQL_DB}")
             self.reload_data()
         except Exception as e:
-            print(f"⚠️ Warning: Failed to connect to MySQL at {settings.MYSQL_HOST}:{settings.MYSQL_PORT}: {e}")
-            self.pool = None
+            print(f"⚠️ Warning: Failed to connect to default MySQL at {settings.MYSQL_HOST}:{settings.MYSQL_PORT}: {e}")
+            self.default_pool = None
 
-    def get_connection(self):
-        if self.pool is None:
-            self._init_db()
-        return self.pool.getconn()
+    def is_custom_database(self, session_id: Optional[str] = None) -> bool:
+        """Returns True if the session is currently connected to a customer database."""
+        return bool(session_id and session_id in self._tenant_pools)
 
-    def release_connection(self, conn):
-        if self.pool and conn:
-            self.pool.putconn(conn)
+    def get_active_db_info(self, session_id: Optional[str] = None) -> Dict[str, Any]:
+        """Returns metadata about the active database connection for this session."""
+        if self.is_custom_database(session_id):
+            cfg = self._tenant_configs.get(session_id, {})
+            return {
+                "mode": "custom",
+                "database": cfg.get("database", "custom_db"),
+                "host": cfg.get("host", "unknown"),
+                "port": cfg.get("port", 3306),
+                "db_type": cfg.get("db_type", "mysql")
+            }
+        return {
+            "mode": "default",
+            "database": settings.MYSQL_DB or "tiby_hackathon",
+            "host": settings.MYSQL_HOST or "localhost",
+            "port": settings.MYSQL_PORT or 3306,
+            "db_type": "mysql"
+        }
 
-    def reload_data(self):
-        """Refreshes all in-memory dynamic schema, foreign key, and entity caches."""
-        self._cached_schema_profile = None
-        self._cached_value_map = None
-        self._cached_distinct_entities = None
-        self._cached_anchor_date = None
-        self._cached_max_dataset_date = None
-        self._cached_foreign_keys = None
-        self._cached_tables = None
-        self._existing_views = None
-
-    def has_view(self, view_name: str) -> bool:
-        """Checks if an analytical view exists in the connected MySQL database."""
-        if hasattr(self, "_existing_views") and self._existing_views is not None:
-            return view_name.lower() in self._existing_views
-
-        try:
-            conn = self.get_connection()
-            try:
-                cur = conn.cursor()
-                cur.execute("SELECT table_name FROM information_schema.views WHERE table_schema = DATABASE();")
-                self._existing_views = {str(r[0]).lower() for r in cur.fetchall()}
-                cur.close()
-            finally:
-                self.release_connection(conn)
-        except Exception:
-            self._existing_views = set()
-
-        return view_name.lower() in self._existing_views
-
-    def execute_query(self, query: str, params: Optional[Tuple] = None) -> Tuple[pd.DataFrame, float, int]:
+    def connect_tenant_database(self, session_id: str, db_config: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Executes a parameterized or read-only SQL query on MySQL 8.0.
+        Connects a customer database for the given session.
+        Enforces read-only transactions and generates an onboarding optimization report.
+        """
+        host = str(db_config.get("host", "")).strip()
+        port = int(db_config.get("port", 3306))
+        user = str(db_config.get("username") or db_config.get("user") or "").strip()
+        password = str(db_config.get("password", ""))
+        database = str(db_config.get("database", "")).strip()
+        db_type = str(db_config.get("db_type", "mysql")).lower()
+        use_ssl = bool(db_config.get("ssl", False))
+
+        if not host:
+            raise ValueError("Database host address is required.")
+        if not database:
+            raise ValueError("Database name is required.")
+        if not user:
+            raise ValueError("Database username is required.")
+
+        ssl_config = {"ssl": {"ssl_mode": "REQUIRED"}} if use_ssl else None
+
+        # 1. Pre-flight connectivity check with strict 6s timeout
+        try:
+            test_conn = pymysql.connect(
+                host=host,
+                port=port,
+                user=user,
+                password=password,
+                database=database,
+                connect_timeout=6,
+                read_timeout=10,
+                write_timeout=10,
+                autocommit=True,
+                **(ssl_config if ssl_config else {})
+            )
+            # Verify read-only enforcement
+            try:
+                with test_conn.cursor() as cur:
+                    cur.execute("SET SESSION TRANSACTION READ ONLY;")
+            except Exception:
+                pass
+            test_conn.close()
+        except pymysql.err.OperationalError as e:
+            code, msg = e.args if len(e.args) >= 2 else (0, str(e))
+            if code == 1045:
+                raise ValueError(f"Authentication Failed (1045): Access denied for user '{user}'. Please verify your username and password.") from e
+            elif code == 1049:
+                raise ValueError(f"Database Not Found (1049): Unknown database '{database}'. Please verify the database exists on host '{host}'.") from e
+            elif code in (2003, 2005):
+                raise ValueError(f"Host Unreachable ({code}): Could not resolve or connect to '{host}' on port {port}. Please check the hostname and ensure firewall / AWS security group rules allow traffic.") from e
+            elif "timed out" in str(msg).lower():
+                raise ValueError(f"Connection Timed Out: Connection to {host}:{port} timed out after 6 seconds. Please verify network routing and firewall rules.") from e
+            else:
+                raise ValueError(f"MySQL Connection Error ({code}): {msg}") from e
+        except Exception as e:
+            raise ValueError(f"Failed to connect to database at {host}:{port}: {e}") from e
+
+        # 2. Close previous tenant connection if one existed for this session
+        if session_id in self._tenant_pools:
+            try:
+                self._tenant_pools[session_id].close_all()
+            except Exception:
+                pass
+
+        # 3. Create isolated tenant pool with read-only enforcement
+        tenant_pool = PyMySQLConnectionPool(
+            host=host,
+            port=port,
+            user=user,
+            password=password,
+            db=database,
+            minconn=1,
+            maxconn=5,
+            read_only=True,
+            use_ssl=use_ssl
+        )
+
+        self._tenant_pools[session_id] = tenant_pool
+        self._tenant_configs[session_id] = {
+            "host": host,
+            "port": port,
+            "database": database,
+            "user": user,
+            "db_type": db_type,
+            "ssl": use_ssl,
+            "connected_at": time.time()
+        }
+
+        # 4. Clear and rebuild session metadata
+        self.reload_data(session_id)
+        schema_prof = self.get_schema_profile(session_id)
+        indexes = self.get_indexes(session_id)
+        fks = self.get_foreign_keys(session_id)
+        row_counts = self.get_table_row_counts(session_id)
+
+        # 5. Run Database Profiler & Index Advisor
+        from backend.engine.index_advisor import index_advisor
+        advisor_report = index_advisor.profile_schema(schema_prof, indexes, fks, row_counts)
+        self._tenant_advisors[session_id] = advisor_report
+
+        total_rows = sum(row_counts.values())
+
+        return {
+            "status": "connected",
+            "session_id": session_id,
+            "database": database,
+            "host": host,
+            "port": port,
+            "tables_count": len(schema_prof),
+            "tables": list(schema_prof.keys()),
+            "total_rows": total_rows,
+            "advisor_report": advisor_report
+        }
+
+    def disconnect_tenant_database(self, session_id: str) -> bool:
+        """Disconnects customer database and seamlessly reverts session to default demo database."""
+        if session_id in self._tenant_pools:
+            try:
+                self._tenant_pools[session_id].close_all()
+            except Exception:
+                pass
+            del self._tenant_pools[session_id]
+
+        self._tenant_configs.pop(session_id, None)
+        self._tenant_advisors.pop(session_id, None)
+        self._clear_session_caches(session_id)
+        return True
+
+    def get_tenant_advisor_report(self, session_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Retrieves the proactive index optimization advice for the connected database."""
+        if session_id and session_id in self._tenant_advisors:
+            return self._tenant_advisors[session_id]
+
+        # If on default database, generate for default
+        schema_prof = self.get_schema_profile()
+        indexes = self.get_indexes()
+        fks = self.get_foreign_keys()
+        row_counts = self.get_table_row_counts()
+        from backend.engine.index_advisor import index_advisor
+        return index_advisor.profile_schema(schema_prof, indexes, fks, row_counts)
+
+    def _clear_session_caches(self, session_id: str):
+        self._cached_schema_profiles.pop(session_id, None)
+        self._cached_indexes_map.pop(session_id, None)
+        self._cached_foreign_keys_map.pop(session_id, None)
+        self._cached_tables_map.pop(session_id, None)
+        self._cached_distinct_entities_map.pop(session_id, None)
+        self._cached_value_maps.pop(session_id, None)
+        self._cached_max_dates.pop(session_id, None)
+        self._existing_views_map.pop(session_id, None)
+
+    def _resolve_pool(self, session_id: Optional[str] = None) -> PyMySQLConnectionPool:
+        if session_id and session_id in self._tenant_pools:
+            return self._tenant_pools[session_id]
+        if self.default_pool is None:
+            self._init_db()
+        if self.default_pool is None:
+            raise RuntimeError("Database connection pool is uninitialized.")
+        return self.default_pool
+
+    def get_connection(self, session_id: Optional[str] = None):
+        pool = self._resolve_pool(session_id)
+        return pool.getconn()
+
+    def release_connection(self, conn, session_id: Optional[str] = None):
+        pool = self._resolve_pool(session_id)
+        pool.putconn(conn)
+
+    def reload_data(self, session_id: Optional[str] = None):
+        """Refreshes in-memory dynamic schema, index, foreign key, and entity caches."""
+        key = session_id or "__default__"
+        self._cached_schema_profiles.pop(key, None)
+        self._cached_indexes_map.pop(key, None)
+        self._cached_foreign_keys_map.pop(key, None)
+        self._cached_tables_map.pop(key, None)
+        self._cached_distinct_entities_map.pop(key, None)
+        self._cached_value_maps.pop(key, None)
+        self._cached_max_dates.pop(key, None)
+        self._existing_views_map.pop(key, None)
+
+    def has_view(self, view_name: str, session_id: Optional[str] = None) -> bool:
+        """Checks if an analytical view exists in the target database."""
+        key = session_id or "__default__"
+        if key not in self._existing_views_map:
+            try:
+                conn = self.get_connection(session_id)
+                try:
+                    cur = conn.cursor()
+                    cur.execute("SELECT table_name FROM information_schema.views WHERE table_schema = DATABASE();")
+                    self._existing_views_map[key] = {str(r[0]).lower() for r in cur.fetchall()}
+                    cur.close()
+                finally:
+                    self.release_connection(conn, session_id)
+            except Exception:
+                self._existing_views_map[key] = set()
+
+        return view_name.lower() in self._existing_views_map.get(key, set())
+
+    def execute_query(
+        self,
+        query: str,
+        params: Optional[Tuple] = None,
+        session_id: Optional[str] = None
+    ) -> Tuple[pd.DataFrame, float, int]:
+        """
+        Executes a read-only SQL query on the resolved database (Default or Customer Tenant).
         Enforces universal sensitive data masking on all returned records.
         Returns (DataFrame, latency_ms, row_count).
         """
         start = time.perf_counter()
-        conn = self.get_connection()
+        conn = self.get_connection(session_id)
         try:
             cur = conn.cursor()
             clean_sql = query.strip()
@@ -193,7 +412,7 @@ class DatabaseManager:
 
             cur.close()
         finally:
-            self.release_connection(conn)
+            self.release_connection(conn, session_id)
 
         elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
         row_count = len(df)
@@ -215,13 +434,14 @@ class DatabaseManager:
             return 2026
 
     # -------------------------------------------------------------------------
-    # 1. Universal Dynamic Database Introspection (information_schema)
+    # 1. Zero-DDL Dynamic Introspection (information_schema)
     # -------------------------------------------------------------------------
 
-    def get_tables_and_views(self) -> Dict[str, str]:
+    def get_tables_and_views(self, session_id: Optional[str] = None) -> Dict[str, str]:
         """Dynamically discovers all tables and views in the connected database schema."""
-        if self._cached_tables is not None:
-            return self._cached_tables
+        key = session_id or "__default__"
+        if key in self._cached_tables_map:
+            return self._cached_tables_map[key]
 
         tables = {}
         try:
@@ -230,7 +450,7 @@ class DatabaseManager:
                 FROM information_schema.tables 
                 WHERE table_schema = DATABASE()
                 ORDER BY table_type DESC, table_name ASC;
-            """)
+            """, session_id=session_id)
             for _, row in df.iterrows():
                 t_name = str(row["table_name"]).lower()
                 t_type = "VIEW" if "VIEW" in str(row["table_type"]).upper() else "BASE TABLE"
@@ -238,13 +458,69 @@ class DatabaseManager:
         except Exception as e:
             print(f"Error fetching tables: {e}")
 
-        self._cached_tables = tables
+        self._cached_tables_map[key] = tables
         return tables
 
-    def get_foreign_keys(self) -> List[Dict[str, str]]:
+    def get_indexes(self, session_id: Optional[str] = None) -> Dict[str, List[Dict[str, Any]]]:
+        """Introspects existing B-Tree indexes from information_schema.statistics without running any DDL."""
+        key = session_id or "__default__"
+        if key in self._cached_indexes_map:
+            return self._cached_indexes_map[key]
+
+        indexes_by_table: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        try:
+            query = """
+                SELECT table_name, index_name, column_name, seq_in_index, non_unique, index_type
+                FROM information_schema.statistics
+                WHERE table_schema = DATABASE()
+                ORDER BY table_name, index_name, seq_in_index;
+            """
+            df, _, count = self.execute_query(query, session_id=session_id)
+            for _, row in df.iterrows():
+                tbl = str(row["table_name"]).lower()
+                idx_name = str(row["index_name"])
+                col_name = str(row["column_name"])
+                is_unique = (int(row["non_unique"]) == 0)
+                idx_type = str(row["index_type"])
+
+                if tbl not in indexes_by_table:
+                    indexes_by_table[tbl] = {}
+                if idx_name not in indexes_by_table[tbl]:
+                    indexes_by_table[tbl][idx_name] = {
+                        "name": idx_name,
+                        "columns": [],
+                        "is_unique": is_unique,
+                        "type": idx_type
+                    }
+                indexes_by_table[tbl][idx_name]["columns"].append(col_name)
+
+            final_indexes = {
+                tbl: list(idx_dict.values())
+                for tbl, idx_dict in indexes_by_table.items()
+            }
+            self._cached_indexes_map[key] = final_indexes
+            return final_indexes
+        except Exception as e:
+            return {}
+
+    def get_table_row_counts(self, session_id: Optional[str] = None) -> Dict[str, int]:
+        """Reads approximate table row counts from information_schema without running full COUNT(*) scans."""
+        try:
+            query = """
+                SELECT table_name, table_rows 
+                FROM information_schema.tables 
+                WHERE table_schema = DATABASE();
+            """
+            df, _, _ = self.execute_query(query, session_id=session_id)
+            return {str(r["table_name"]).lower(): int(r["table_rows"] or 0) for _, r in df.iterrows()}
+        except Exception:
+            return {}
+
+    def get_foreign_keys(self, session_id: Optional[str] = None) -> List[Dict[str, str]]:
         """Dynamically extracts Foreign Key relationships between tables."""
-        if self._cached_foreign_keys is not None:
-            return self._cached_foreign_keys
+        key = session_id or "__default__"
+        if key in self._cached_foreign_keys_map:
+            return self._cached_foreign_keys_map[key]
 
         fks = []
         try:
@@ -261,7 +537,7 @@ class DatabaseManager:
                 WHERE kcu.table_schema = DATABASE()
                   AND tc.constraint_type = 'FOREIGN KEY'
                   AND kcu.referenced_table_name IS NOT NULL;
-            """)
+            """, session_id=session_id)
             for _, row in df.iterrows():
                 fks.append({
                     "from_table": str(row["table_name"]).lower(),
@@ -272,20 +548,21 @@ class DatabaseManager:
         except Exception as e:
             print(f"Error fetching foreign keys: {e}")
 
-        self._cached_foreign_keys = fks
+        self._cached_foreign_keys_map[key] = fks
         return fks
 
-    def get_schema_profile(self) -> Dict[str, Dict[str, Any]]:
+    def get_schema_profile(self, session_id: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
         """
-        Dynamically introspects ANY database to discover all tables, columns,
+        Dynamically introspects the database to discover all tables, columns,
         data types, key constraints, and 3-5 distinct sample values.
         Zero hardcoded table names or schemas.
         """
-        if self._cached_schema_profile is not None:
-            return self._cached_schema_profile
+        key = session_id or "__default__"
+        if key in self._cached_schema_profiles:
+            return self._cached_schema_profiles[key]
 
         profile: Dict[str, Dict[str, Any]] = {}
-        tables = self.get_tables_and_views()
+        tables = self.get_tables_and_views(session_id)
 
         # Step 1: Discover columns, data types, nullability, keys
         try:
@@ -299,7 +576,7 @@ class DatabaseManager:
                 FROM information_schema.columns 
                 WHERE table_schema = DATABASE()
                 ORDER BY table_name, ordinal_position;
-            """)
+            """, session_id=session_id)
 
             for _, row in df_cols.iterrows():
                 t_name = str(row["table_name"]).lower()
@@ -318,18 +595,16 @@ class DatabaseManager:
         except Exception as e:
             print(f"Error inspecting columns: {e}")
 
-        # Step 2: Sample distinct values for categorical / text columns (3 to 5 samples)
+        # Step 2: Sample distinct values for categorical / text columns
         for t_name, cols in profile.items():
             for c_name, c_info in cols.items():
                 d_type = c_info.get("type", "")
                 is_text = any(t in d_type for t in ["CHAR", "TEXT", "ENUM"])
-                # Exclude internal UUIDs, hashes, encrypted fields, and passwords
                 is_sensitive = any(k in c_name for k in ["password", "hash", "secret", "token", "salt"])
                 is_id = (c_name.endswith("_id") or c_name == "id") and not any(k in c_name for k in ["code", "type", "category"])
 
                 if is_text and not is_sensitive and not is_id:
                     try:
-                        # Use a subquery with LIMIT to prevent full table scans on 17M row tables
                         df_s, _, s_cnt = self.execute_query(f"""
                             SELECT DISTINCT `{c_name}` AS val 
                             FROM (
@@ -339,24 +614,37 @@ class DatabaseManager:
                             ) AS subq
                             WHERE TRIM(CAST(`{c_name}` AS CHAR)) != '' 
                             LIMIT 15;
-                        """)
+                        """, session_id=session_id)
                         vals = [str(v) for v in df_s["val"].tolist() if pd.notnull(v)]
                         if vals:
                             profile[t_name][c_name]["sample_values"] = vals
                     except Exception:
                         pass
 
-
-
-        self._cached_schema_profile = profile
+        self._cached_schema_profiles[key] = profile
         return profile
 
-    def get_max_dataset_date(self) -> str:
-        """Dynamically finds the maximum date recorded across all discovered date columns."""
-        if getattr(self, "_cached_max_dataset_date", None):
-            return self._cached_max_dataset_date
+    def get_schema_prompt_context(self, session_id: Optional[str] = None) -> str:
+        """Generates a concise, formatted schema summary for LLM prompt injection."""
+        profile = self.get_schema_profile(session_id)
+        lines = ["CURRENT DATABASE SCHEMA & DOMAIN PROFILE:"]
+        for table, cols in profile.items():
+            lines.append(f"\nTable/View: `{table}`")
+            lines.append("Columns:")
+            for col, info in cols.items():
+                col_type = info.get("type", "UNKNOWN") if isinstance(info, dict) else str(info)
+                samples = info.get("sample_values", []) if isinstance(info, dict) else []
+                sample_str = f" | Sample Values: {samples[:5]}" if samples else ""
+                lines.append(f"  - `{col}` ({col_type}){sample_str}")
+        return "\n".join(lines)
 
-        profile = self.get_schema_profile()
+    def get_max_dataset_date(self, session_id: Optional[str] = None) -> str:
+        """Dynamically finds the maximum date recorded across all discovered date columns."""
+        key = session_id or "__default__"
+        if key in self._cached_max_dates:
+            return self._cached_max_dates[key]
+
+        profile = self.get_schema_profile(session_id)
         max_dates = []
 
         for t_name, cols in profile.items():
@@ -364,19 +652,16 @@ class DatabaseManager:
                 d_type = c_info.get("type", "")
                 if any(t in d_type for t in ["DATE", "TIMESTAMP", "DATETIME"]) or "date" in c_name:
                     try:
-                        # Quick lookup by sorting the table by date DESC and taking the top row.
-                        # For tables with indexes, this is O(1). 
-                        # To avoid full table scans on unindexed 17M tables, we use a simple subquery limit fallback
                         df, _, cnt = self.execute_query(f"""
                             SELECT DATE_FORMAT(`{c_name}`, '%Y-%m-%d') AS max_dt 
                             FROM (
                                 SELECT `{c_name}` FROM `{t_name}` 
                                 WHERE `{c_name}` IS NOT NULL 
-                                LIMIT 1000000
+                                LIMIT 500000
                             ) AS subq
                             ORDER BY `{c_name}` DESC
                             LIMIT 1;
-                        """)
+                        """, session_id=session_id)
                         if cnt > 0 and pd.notnull(df["max_dt"].iloc[0]):
                             val = str(df["max_dt"].iloc[0])
                             if len(val) >= 10:
@@ -385,18 +670,19 @@ class DatabaseManager:
                         pass
 
         if max_dates:
-            self._cached_max_dataset_date = max(max_dates)
-            return self._cached_max_dataset_date
+            self._cached_max_dates[key] = max(max_dates)
+            return self._cached_max_dates[key]
 
         return self.get_anchor_date()
 
-    def get_distinct_entities(self) -> Dict[str, List[Any]]:
+    def get_distinct_entities(self, session_id: Optional[str] = None) -> Dict[str, List[Any]]:
         """
         Dynamically extracts distinct entity values from all categorical columns.
         Provides both generic discovered entities and backward-compatible keys.
         """
-        if self._cached_distinct_entities:
-            return self._cached_distinct_entities
+        key = session_id or "__default__"
+        if key in self._cached_distinct_entities_map:
+            return self._cached_distinct_entities_map[key]
 
         entities: Dict[str, List[Any]] = {
             "banks": [],
@@ -406,7 +692,7 @@ class DatabaseManager:
             "all_categorical_values": []
         }
 
-        profile = self.get_schema_profile()
+        profile = self.get_schema_profile(session_id)
         all_vals: Set[str] = set()
 
         for t_name, cols in profile.items():
@@ -416,31 +702,36 @@ class DatabaseManager:
                     if len(str(s)) >= 2:
                         all_vals.add(str(s))
 
-
-
-        # Ensure unique items
         for k in entities:
             if isinstance(entities[k], list):
                 entities[k] = list(dict.fromkeys(entities[k]))
 
-        # If banks is still empty, attempt direct query on bank table if present
-        if not entities["banks"] and "bank" in profile:
-            try:
-                df, _, _ = self.execute_query("SELECT DISTINCT bank_name FROM bank WHERE bank_name IS NOT NULL;")
-                entities["banks"] = [str(x) for x in df["bank_name"].tolist() if pd.notnull(x)]
-            except Exception:
-                pass
+        # Look for explicit bank / vendor table if available
+        for bank_cand in ["bank", "banks", "vendor", "vendors"]:
+            if bank_cand in profile and not entities["banks"]:
+                for col in ["bank_name", "vendor_name", "name"]:
+                    if col in profile[bank_cand]:
+                        try:
+                            df, _, _ = self.execute_query(
+                                f"SELECT DISTINCT `{col}` FROM `{bank_cand}` WHERE `{col}` IS NOT NULL;",
+                                session_id=session_id
+                            )
+                            entities["banks"] = [str(x) for x in df[col].tolist() if pd.notnull(x)]
+                            break
+                        except Exception:
+                            pass
 
         entities["all_categorical_values"] = list(all_vals)
-        self._cached_distinct_entities = entities
+        self._cached_distinct_entities_map[key] = entities
         return entities
 
-    def get_value_to_column_map(self) -> Dict[str, List[Dict[str, str]]]:
+    def get_value_to_column_map(self, session_id: Optional[str] = None) -> Dict[str, List[Dict[str, str]]]:
         """Maps distinct categorical values to their source (table, column) for schema linking."""
-        if self._cached_value_map:
-            return self._cached_value_map
+        key = session_id or "__default__"
+        if key in self._cached_value_maps:
+            return self._cached_value_maps[key]
 
-        profile = self.get_schema_profile()
+        profile = self.get_schema_profile(session_id)
         val_map: Dict[str, List[Dict[str, str]]] = {}
 
         for table_name, cols in profile.items():
@@ -459,38 +750,8 @@ class DatabaseManager:
                         "canonical": str(val).strip()
                     })
 
-        self._cached_value_map = val_map
+        self._cached_value_maps[key] = val_map
         return val_map
-
-    def get_schema_prompt_context(self) -> str:
-        """
-        Produces a compact, highly structured DDL + sample values representation of the
-        connected database for dynamic prompt injection. Zero hardcoding.
-        """
-        profile = self.get_schema_profile()
-        tables = self.get_tables_and_views()
-        fks = self.get_foreign_keys()
-
-        lines = ["CONNECTED DATABASE SCHEMA (MySQL 8.0 Live Introspection):"]
-        
-        # Display each discovered table/view
-        for t_name, t_type in sorted(tables.items(), key=lambda x: (x[1] != "VIEW", x[0])):
-            cols = profile.get(t_name, {})
-            lines.append(f"\n{t_type}: `{t_name}`")
-            lines.append("  Columns:")
-            for c_name, c_info in cols.items():
-                d_type = c_info.get("type", "TEXT")
-                pk_marker = " [PRIMARY KEY]" if c_info.get("is_primary") else ""
-                samples = c_info.get("sample_values")
-                sample_str = f" | Samples: {samples}" if samples else ""
-                lines.append(f"    - `{c_name}` ({d_type}){pk_marker}{sample_str}")
-
-        if fks:
-            lines.append("\nForeign Key Relationships (Table Joins):")
-            for fk in fks:
-                lines.append(f"  - `{fk['from_table']}`.`{fk['from_column']}` -> `{fk['to_table']}`.`{fk['to_column']}`")
-
-        return "\n".join(lines)
 
 
 db = DatabaseManager()

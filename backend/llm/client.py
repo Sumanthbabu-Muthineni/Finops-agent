@@ -364,11 +364,12 @@ class LLMAdapter:
         last_ast: Optional[Dict[str, Any]] = None,
         conversation_history: Optional[List[Dict[str, str]]] = None,
         active_context_vendor: Optional[str] = None,
-        session_confirmed_entities: Optional[Dict[str, str]] = None
+        session_confirmed_entities: Optional[Dict[str, str]] = None,
+        session_id: Optional[str] = None
     ) -> FinancialQueryAST:
         from backend.engine.db import db
-        anchor = anchor_date or db.get_anchor_date()
-        schema_context = db.get_schema_prompt_context()
+        anchor = anchor_date or db.get_anchor_date(session_id)
+        schema_context = db.get_schema_prompt_context(session_id)
 
         system_prompt = (
             "You are a strict, schema-driven Analytical AST Generator for an 8B model.\n"

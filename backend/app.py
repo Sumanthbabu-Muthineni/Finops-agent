@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.config import settings
 from backend.core.models import (
     ChatRequest, ChatResponse, ConfidenceBreakdown, AnomalyInfo,
-    SummaryMetric, AuditTrail
+    SummaryMetric, AuditTrail, ConnectDbRequest, ConnectDbResponse, DisconnectDbResponse
 )
 from backend.graph.workflow import financial_agent_graph
 from backend.engine.db import db
@@ -42,6 +42,77 @@ def health_check():
         "total_accounts": len(entities.get("entities", [])),
         "total_vendors": len(entities.get("banks", [])),
         "environment": "production" if not settings.DEBUG else "development"
+    }
+
+@app.get("/api/db/status/{session_id}")
+def get_db_status(session_id: str):
+    """Returns active database connection info and whether custom DB is active for this session."""
+    info = db.get_active_db_info(session_id)
+    is_custom = db.is_custom_database(session_id)
+    schema = db.get_schema_profile(session_id)
+    return {
+        "session_id": session_id,
+        "is_custom": is_custom,
+        "info": info,
+        "tables_count": len(schema),
+        "tables": list(schema.keys())
+    }
+
+@app.post("/api/db/connect", response_model=ConnectDbResponse)
+def connect_database(request: ConnectDbRequest):
+    """
+    Connects customer's MySQL database with zero-DDL read-only transaction mode.
+    Profiles schema and returns proactive optimization recommendations.
+    """
+    session_id = request.session_id or str(uuid.uuid4())
+    config_dict = {
+        "host": request.host,
+        "port": request.port,
+        "username": request.username or request.user,
+        "password": request.password,
+        "database": request.database,
+        "ssl": request.ssl
+    }
+    try:
+        res = db.connect_tenant_database(session_id, config_dict)
+        return ConnectDbResponse(
+            success=True,
+            session_id=session_id,
+            database=res["database"],
+            host=res["host"],
+            port=res["port"],
+            tables_count=res["tables_count"],
+            tables=res["tables"],
+            total_rows=res["total_rows"],
+            advisor_report=res.get("advisor_report"),
+            message=f"Successfully connected to {res['database']} ({res['tables_count']} tables, {res['total_rows']:,} rows). Read-only mode activated."
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected error connecting to database: {e}")
+
+@app.post("/api/db/disconnect", response_model=DisconnectDbResponse)
+def disconnect_database(payload: Dict[str, Any]):
+    """Disconnects customer database and reverts session to default demo DB."""
+    session_id = payload.get("session_id")
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required.")
+    db.disconnect_tenant_database(session_id)
+    return DisconnectDbResponse(
+        success=True,
+        session_id=session_id,
+        message="Disconnected from custom database. Reverted to default FinOps database."
+    )
+
+@app.get("/api/db/advisor/{session_id}")
+def get_advisor_report(session_id: str):
+    """Returns the zero-DDL index and schema advisor report for the active database."""
+    report = db.get_tenant_advisor_report(session_id)
+    return {
+        "session_id": session_id,
+        "is_custom": db.is_custom_database(session_id),
+        "report": report
     }
 
 @app.get("/api/banks")
@@ -165,11 +236,21 @@ def chat_endpoint(request: ChatRequest):
             else:
                 anomaly_obj = AnomalyInfo()
 
+            advisories_raw = final_state.get("optimization_advisories", [])
+            formatted_advisories = [
+                a["advisory"] if isinstance(a, dict) and "advisory" in a else (
+                    a.get("suggested_sql") if isinstance(a, dict) and "suggested_sql" in a else str(a)
+                )
+                for a in advisories_raw
+            ]
+
             audit_trail_obj = AuditTrail(
                 sql_query=final_state.get("compiled_sql") or "N/A",
                 execution_time_ms=final_state.get("execution_time_ms", 0.0),
                 rows_scanned=final_state.get("row_count", 0),
-                model_used=f"8B ({settings.LLM_PROVIDER})"
+                model_used=f"8B ({settings.LLM_PROVIDER})",
+                index_status=final_state.get("query_index_status"),
+                advisories=formatted_advisories
             )
 
     summary_metrics = [

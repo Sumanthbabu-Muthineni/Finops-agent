@@ -104,8 +104,9 @@ def ast_generator_node(state: FinancialAgentState) -> Dict[str, Any]:
     anchor_date = db.get_anchor_date()
     last_ast = state.get("last_ast")
     history = state.get("conversation_history") or []
-    active_vendor = state.get("active_context_vendor")
     session_confirmed = state.get("session_confirmed_entities") or {}
+    active_vendor = state.get("active_context_vendor")
+    session_id = state.get("session_id")
 
     ast_obj = llm_adapter.generate_ast(
         query=query,
@@ -114,7 +115,8 @@ def ast_generator_node(state: FinancialAgentState) -> Dict[str, Any]:
         last_ast=last_ast,
         conversation_history=history,
         active_context_vendor=active_vendor,
-        session_confirmed_entities=session_confirmed
+        session_confirmed_entities=session_confirmed,
+        session_id=session_id
     )
 
     return {
@@ -128,9 +130,10 @@ def sql_compiler_node(state: FinancialAgentState) -> Dict[str, Any]:
     """Node 3: Deterministic compilation from AST to parameterized MySQL ANSI-SQL."""
     ast_dict = state["current_ast"]
     ast_obj = FinancialQueryAST(**ast_dict)
+    session_id = state.get("session_id")
 
-    compiled_sql = query_compiler.compile(ast_obj)
-    records_sql = query_compiler.compile_records_query(ast_obj)
+    compiled_sql = query_compiler.compile(ast_obj, session_id=session_id)
+    records_sql = query_compiler.compile_records_query(ast_obj, session_id=session_id)
 
     return {
         "compiled_sql": compiled_sql,
@@ -141,12 +144,13 @@ def db_execution_and_iqr_node(state: FinancialAgentState) -> Dict[str, Any]:
     """Node 4: Executes MySQL ANSI-SQL (zero LLM math) and triggers IQR Anomaly Hook."""
     compiled_sql = state["compiled_sql"]
     records_sql = state["records_sql"]
+    session_id = state.get("session_id")
 
     # 1. Execute summary aggregation query
-    summary_df, latency_ms, _ = db.execute_query(compiled_sql)
+    summary_df, latency_ms, _ = db.execute_query(compiled_sql, session_id=session_id)
 
     # 2. Execute granular records query for AgGrid and CSV export
-    records_df, _, row_count = db.execute_query(records_sql)
+    records_df, _, row_count = db.execute_query(records_sql, session_id=session_id)
 
     # 3. Trigger IQR Anomaly Hook
     records_df, anomaly_info = iqr_detector.detect(records_df, amount_col="amount")
@@ -311,6 +315,42 @@ def db_execution_and_iqr_node(state: FinancialAgentState) -> Dict[str, Any]:
         "anomaly": anomaly_info.model_dump()
     }
 
+def index_advisor_node(state: FinancialAgentState) -> Dict[str, Any]:
+    """Node 4B: Proactively inspects runtime query execution against database index coverage."""
+    session_id = state.get("session_id")
+    ast_dict = state.get("current_ast") or {}
+    target_table = state.get("target_domain") or ast_dict.get("target_domain") or "transaction"
+    filters = ast_dict.get("entity_filters") or []
+    date_range = ast_dict.get("date_range")
+    date_col = ast_dict.get("date_column")
+
+    filter_cols = [f.get("field") for f in filters if f.get("field")]
+    if date_range and date_col:
+        filter_cols.append(date_col)
+
+    indexes = db.get_indexes(session_id)
+    latency_ms = state.get("execution_time_ms", 0.0)
+
+    from backend.engine.index_advisor import index_advisor
+    analysis = index_advisor.analyze_runtime_query(
+        table=target_table,
+        filter_columns=filter_cols,
+        indexes=indexes,
+        execution_time_ms=latency_ms
+    )
+
+    advisories = []
+    if analysis.get("advisory"):
+        advisories.append(analysis)
+
+    is_custom = db.is_custom_database(session_id)
+
+    return {
+        "query_index_status": analysis.get("status", "INDEX_ACCELERATED"),
+        "optimization_advisories": advisories,
+        "is_custom_database": is_custom
+    }
+
 def confidence_gate_node(state: FinancialAgentState) -> Dict[str, Any]:
     """Node 5: Computes Quantitative Confidence Score (0-100%)."""
     entity_score = state.get("entity_score", 1.0)
@@ -419,6 +459,13 @@ def synthesizer_node(state: FinancialAgentState) -> Dict[str, Any]:
         resolved_vendor=resolved_vendor,
         unit=domain_unit
     )
+
+    # Append proactive index performance note if query suffered from unindexed scan on custom database
+    advisories = state.get("optimization_advisories") or []
+    if advisories and state.get("is_custom_database"):
+        first_adv = advisories[0].get("advisory")
+        if first_adv and first_adv not in narrative:
+            narrative += f"\n\n> {first_adv}"
 
     return {
         "final_narrative": narrative,

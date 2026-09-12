@@ -35,3 +35,8 @@ class FinancialAgentState(TypedDict):
     clarification_options: Optional[List[str]]
     final_narrative: Optional[str]
     status: str
+
+    # Proactive Index & Schema Optimization Intelligence
+    optimization_advisories: Optional[List[Dict[str, Any]]]
+    is_custom_database: Optional[bool]
+    query_index_status: Optional[str]

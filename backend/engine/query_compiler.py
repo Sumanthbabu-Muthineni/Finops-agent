@@ -2,7 +2,7 @@
 TBX FinOps Assistant - Universal Dynamic Query Compiler (MySQL 8.0 Native)
 Compiles typed AST into secure, parameterized MySQL 8.0 ANSI-SQL queries.
 Zero hardcoded domain or column schemas. Leverages SchemaValidator for healing
-and sqlglot for strict read-only AST safety validation.
+and sqlglot for strict read-only AST safety validation. Supports multi-tenant BYODB.
 """
 
 import sqlglot
@@ -17,13 +17,13 @@ class QueryCompiler:
     def __init__(self):
         pass
 
-    def get_source_relation(self, target_table: str, required_columns: Set[str]) -> str:
+    def get_source_relation(self, target_table: str, required_columns: Set[str], session_id: Optional[str] = None) -> str:
         """
         Determines the optimal source table, view, or dynamically synthesized join.
         If the target table already contains all required columns (e.g. a view or single table),
-        it is used directly. Otherwise, traverses foreign keys to build necessary JOINs.
+        it is used directly. Otherwise, traverses foreign keys to build necessary minimal JOINs.
         """
-        profile = db.get_schema_profile()
+        profile = db.get_schema_profile(session_id)
         table_clean = target_table.lower().strip()
 
         # 0. Optimization: if target is a view, see if the base table has all required columns
@@ -32,7 +32,6 @@ class QueryCompiler:
         if base_cand.startswith("v_"):
             base_cand = base_cand[2:]
         if base_cand.endswith("s") and base_cand != "transactions":
-            # "transactions" doesn't have an "s" table but "account" does. Let's just try both
             pass 
         
         # Strip trailing 's' if base table is singular (e.g. v_transactions -> transaction)
@@ -51,17 +50,16 @@ class QueryCompiler:
         # 1. Direct table/view usage
         if table_clean in profile:
             table_cols = set(profile[table_clean].keys())
-            # If all required columns exist in this table/view, query directly!
             if required_columns.issubset(table_cols) or not required_columns:
                 return f"`{table_clean}`"
 
-        # 2. Check if an analytical view exists for this domain (e.g. v_transactions)
+        # 2. Check if an analytical view exists for this domain (e.g. v_transactions on demo db)
         view_cand = f"v_{table_clean}" if not table_clean.startswith("v_") else table_clean
-        if db.has_view(view_cand):
+        if db.has_view(view_cand, session_id):
             return f"`{view_cand}`"
 
-        # 3. Dynamic Foreign Key Join Traversal
-        fks = db.get_foreign_keys()
+        # 3. Dynamic Foreign Key Join Traversal (Minimal Join Path)
+        fks = db.get_foreign_keys(session_id)
         joins = []
         joined_tables = {table_clean}
         available_cols = set(profile.get(table_clean, {}).keys())
@@ -87,13 +85,13 @@ class QueryCompiler:
 
         return f"`{table_clean}`"
 
-    def compile(self, raw_ast: FinancialQueryAST) -> str:
+    def compile(self, raw_ast: FinancialQueryAST, session_id: Optional[str] = None) -> str:
         """
         Translates FinancialQueryAST into a secure, parameterized MySQL 8.0 ANSI-SQL string.
         Zero hardcoding: validates and heals columns dynamically against the live database catalog.
         """
-        # 1. Anti-hallucination validation and healing
-        ast = schema_validator.validate_and_heal(raw_ast)
+        # 1. Anti-hallucination validation and healing against active database
+        ast = schema_validator.validate_and_heal(raw_ast, session_id)
         target_table = ast.target_domain
         metric_col = ast.metric_column or "transaction_amount"
         date_col = ast.date_column
@@ -104,7 +102,6 @@ class QueryCompiler:
         # If it's a raw records query and the target is a view, force the view by requesting a column 
         # that only exists in the view (e.g. bank_name or masked_account_number)
         if ast.target_metric == "records_list" and target_table.startswith("v_"):
-            # This ensures we don't accidentally fall back to the base table and lose UI columns
             required_cols.add("bank_name")
             
         if metric_col:
@@ -145,105 +142,87 @@ class QueryCompiler:
                         escaped_vals = ", ".join(f"UPPER('{str(v).replace('\'', '\'\'')}')" for v in vals)
                         where_clauses.append(f"UPPER(CAST({field} AS CHAR)) IN ({escaped_vals})")
             else:
-                col_clauses = []
                 for f in filters:
                     op = f.operator.lower()
                     val = f.value
-                    if op == "eq":
-                        escaped_val = str(val).replace("'", "''")
-                        if field == "utr_number":
-                            enc_val = encrypt_utr(str(val)).replace("'", "''")
-                            col_clauses.append(f"({field} = '{enc_val}' OR {field} = '{escaped_val}')")
-                        else:
-                            col_clauses.append(f"UPPER(CAST({field} AS CHAR)) = UPPER('{escaped_val}')")
+                    if op == "like":
+                        where_clauses.append(f"UPPER(CAST({field} AS CHAR)) LIKE UPPER('%{str(val).replace('\'', '\'\'')}%')")
+                    elif op == "gt":
+                        where_clauses.append(f"{field} > {val}")
+                    elif op == "gte":
+                        where_clauses.append(f"{field} >= {val}")
+                    elif op == "lt":
+                        where_clauses.append(f"{field} < {val}")
+                    elif op == "lte":
+                        where_clauses.append(f"{field} <= {val}")
                     elif op == "neq":
-                        escaped_val = str(val).replace("'", "''")
-                        col_clauses.append(f"UPPER(CAST({field} AS CHAR)) != UPPER('{escaped_val}')")
-                    elif op == "in" and isinstance(val, list):
-                        escaped_vals = ", ".join(f"UPPER('{str(v).replace('\'', '\'\'')}')" for v in val)
-                        col_clauses.append(f"UPPER(CAST({field} AS CHAR)) IN ({escaped_vals})")
-                    elif op == "like":
-                        escaped_val = str(val).replace("'", "''")
-                        col_clauses.append(f"LOWER(CAST({field} AS CHAR)) LIKE LOWER('%{escaped_val}%')")
-                    elif op in ["gt", "lt", "gte", "lte"]:
-                        op_map = {"gt": ">", "lt": "<", "gte": ">=", "lte": "<="}
-                        try:
-                            num_val = float(val)
-                            col_clauses.append(f"{field} {op_map[op]} {num_val}")
-                        except (ValueError, TypeError):
-                            escaped_val = str(val).replace("'", "''")
-                            col_clauses.append(f"{field} {op_map[op]} '{escaped_val}'")
-                if col_clauses:
-                    where_clauses.append("(" + " OR ".join(col_clauses) + ")" if len(col_clauses) > 1 else col_clauses[0])
+                        where_clauses.append(f"UPPER(CAST({field} AS CHAR)) != UPPER('{str(val).replace('\'', '\'\'')}')")
 
-        # Date Range Filters (applied when table has a temporal column)
-        if date_col and ast.date_range:
-            if ast.date_range.start_date:
-                where_clauses.append(f"{date_col} >= '{ast.date_range.start_date}'")
-            if ast.date_range.end_date:
-                where_clauses.append(f"{date_col} <= '{ast.date_range.end_date}'")
+        # Date range boundary filters
+        if ast.date_range and date_col:
+            start_d = ast.date_range.start_date
+            end_d = ast.date_range.end_date
+            where_clauses.append(f"{date_col} >= '{start_d}'")
+            where_clauses.append(f"{date_col} <= '{end_d}'")
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 
-        # 3. Build SELECT, GROUP BY, and ORDER BY clauses
-        mapped_group_bys = []
-        for g in (ast.group_by or []):
-            g_clean = g.lower().strip()
-            if g_clean in ["month", "year", "day"] and date_col:
-                mapped_group_bys.append(g_clean)
-            elif g_clean in required_cols and g_clean != "entity_id":
-                if g_clean not in mapped_group_bys:
-                    mapped_group_bys.append(g_clean)
-
-        if mapped_group_bys:
-            select_group_cols = []
-            actual_group_by_cols = []
-            for g in mapped_group_bys:
-                if date_col and g == "month":
-                    select_group_cols.append(f"MONTH({date_col}) AS month")
-                    actual_group_by_cols.append(f"MONTH({date_col})")
-                elif date_col and g == "year":
-                    select_group_cols.append(f"YEAR({date_col}) AS year")
-                    actual_group_by_cols.append(f"YEAR({date_col})")
-                elif date_col and g == "day":
-                    select_group_cols.append(f"DATE({date_col}) AS day")
-                    actual_group_by_cols.append(f"DATE({date_col})")
+        # 3. Build SELECT, GROUP BY, and ORDER BY
+        if ast.group_by:
+            select_cols = []
+            group_cols = []
+            order_cols = []
+            for g in ast.group_by:
+                g_lower = g.lower().strip()
+                if g_lower == "month" and date_col:
+                    expr = f"DATE_FORMAT(`{date_col}`, '%Y-%m')"
+                    select_cols.append(f"{expr} AS month")
+                    group_cols.append(expr)
+                    order_cols.append(f"month {'DESC' if ast.order_by_desc else 'ASC'}")
+                elif g_lower == "year" and date_col:
+                    expr = f"YEAR(`{date_col}`)"
+                    select_cols.append(f"{expr} AS year")
+                    group_cols.append(expr)
+                    order_cols.append(f"year {'DESC' if ast.order_by_desc else 'ASC'}")
+                elif g_lower == "day" and date_col:
+                    expr = f"DATE_FORMAT(`{date_col}`, '%Y-%m-%d')"
+                    select_cols.append(f"{expr} AS day")
+                    group_cols.append(expr)
+                    order_cols.append(f"day {'DESC' if ast.order_by_desc else 'ASC'}")
                 else:
-                    select_group_cols.append(f"`{g}`")
-                    actual_group_by_cols.append(f"`{g}`")
+                    select_cols.append(f"`{g}`")
+                    group_cols.append(f"`{g}`")
+                    order_cols.append(f"`{g}` ASC")
 
             metric_expr = f"ROUND(COALESCE(SUM(`{metric_col}`), 0), 2)" if metric_col else "0"
-            select_sql = f"SELECT {', '.join(select_group_cols)}, {metric_expr} AS total_amount, COUNT(*) AS record_count"
-            group_sql = f"GROUP BY {', '.join(actual_group_by_cols)}"
-            order_sql = f"ORDER BY total_amount {'DESC' if ast.order_by_desc else 'ASC'}"
+            avg_expr = f"ROUND(COALESCE(AVG(`{metric_col}`), 0), 2)" if metric_col else "0"
+
+            select_sql = f"SELECT {', '.join(select_cols)}, {metric_expr} AS total_amount, COUNT(*) AS record_count, {avg_expr} AS average_amount"
+            group_sql = f"GROUP BY {', '.join(group_cols)}"
+            order_sql = f"ORDER BY {', '.join(order_cols)}"
         else:
-            if ast.target_metric in ["total_amount", "available_balance", "sum"]:
-                metric_expr = f"ROUND(COALESCE(SUM(`{metric_col}`), 0), 2)" if metric_col else "0"
-                avg_expr = f"ROUND(COALESCE(AVG(`{metric_col}`), 0), 2)" if metric_col else "0"
+            metric_expr = f"ROUND(COALESCE(SUM(`{metric_col}`), 0), 2)" if metric_col else "0"
+            avg_expr = f"ROUND(COALESCE(AVG(`{metric_col}`), 0), 2)" if metric_col else "0"
+
+            if ast.target_metric == "total_amount":
                 select_sql = f"SELECT {metric_expr} AS total_amount, COUNT(*) AS record_count, {avg_expr} AS average_amount"
                 group_sql = ""
                 order_sql = ""
-            elif ast.target_metric in ["average_amount", "average"]:
-                metric_expr = f"ROUND(COALESCE(SUM(`{metric_col}`), 0), 2)" if metric_col else "0"
-                avg_expr = f"ROUND(COALESCE(AVG(`{metric_col}`), 0), 2)" if metric_col else "0"
-                select_sql = f"SELECT {avg_expr} AS average_amount, COUNT(*) AS record_count, {metric_expr} AS total_amount"
+            elif ast.target_metric == "available_balance":
+                select_sql = f"SELECT {metric_expr} AS total_amount, COUNT(*) AS record_count, {avg_expr} AS average_amount"
                 group_sql = ""
                 order_sql = ""
-            elif ast.target_metric in ["record_count", "count"]:
-                metric_expr = f"ROUND(COALESCE(SUM(`{metric_col}`), 0), 2)" if metric_col else "0"
-                select_sql = f"SELECT COUNT(*) AS record_count, {metric_expr} AS total_amount"
+            elif ast.target_metric == "average_amount":
+                select_sql = f"SELECT {avg_expr} AS average_amount, COUNT(*) AS record_count"
                 group_sql = ""
                 order_sql = ""
-            elif ast.target_metric in ["min", "max"]:
-                fn = "MIN" if ast.target_metric == "min" else "MAX"
-                metric_expr = f"ROUND(COALESCE({fn}(`{metric_col}`), 0), 2)" if metric_col else "0"
+            elif ast.target_metric == "record_count":
                 select_sql = f"SELECT {metric_expr} AS total_amount, COUNT(*) AS record_count"
                 group_sql = ""
                 order_sql = ""
             else:  # records_list
                 select_sql = "SELECT *"
                 group_sql = ""
-                # Avoid massive filesorts on 17M row views by disabling ORDER BY
                 if target_table.startswith("v_") or target_table == "v_transactions":
                     order_sql = ""
                 else:
@@ -255,7 +234,7 @@ class QueryCompiler:
                         order_sql = ""
 
         limit_sql = f"LIMIT {ast.limit}"
-        source_relation = self.get_source_relation(target_table, required_cols)
+        source_relation = self.get_source_relation(target_table, required_cols, session_id)
 
         sql = f"{select_sql} FROM {source_relation} {where_sql} {group_sql} {order_sql} {limit_sql};".strip()
         sql = " ".join(sql.split())
@@ -264,12 +243,12 @@ class QueryCompiler:
         self.validate_safety(sql)
         return sql
 
-    def compile_records_query(self, ast: FinancialQueryAST) -> str:
+    def compile_records_query(self, ast: FinancialQueryAST, session_id: Optional[str] = None) -> str:
         """Always compiles raw line items query so AgGrid and CSV export have granular records."""
         records_ast = ast.model_copy(deep=True)
         records_ast.target_metric = "records_list"
         records_ast.group_by = []
-        return self.compile(records_ast)
+        return self.compile(records_ast, session_id)
 
     def validate_safety(self, sql: str) -> bool:
         """Enforces that the compiled SQL is strictly a read-only SELECT statement."""
@@ -281,7 +260,6 @@ class QueryCompiler:
         if not isinstance(parsed, exp.Select):
             raise ValueError(f"Security Violation: Only SELECT queries are permitted. Got: {type(parsed)}")
 
-        # Ensure no disallowed expressions (Insert, Update, Delete, Drop, Alter)
         disallowed = (exp.Insert, exp.Update, exp.Delete, exp.Drop, exp.Alter)
         for node in parsed.walk():
             if isinstance(node, disallowed):

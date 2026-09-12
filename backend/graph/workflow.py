@@ -5,6 +5,7 @@ from backend.graph.nodes import (
     ast_generator_node,
     sql_compiler_node,
     db_execution_and_iqr_node,
+    index_advisor_node,
     confidence_gate_node,
     clarification_node,
     synthesizer_node
@@ -34,6 +35,7 @@ def create_financial_agent_graph():
     workflow.add_node("ast_generator", ast_generator_node)
     workflow.add_node("sql_compiler", sql_compiler_node)
     workflow.add_node("db_execution_and_iqr", db_execution_and_iqr_node)
+    workflow.add_node("index_advisor", index_advisor_node)
     workflow.add_node("confidence_gate", confidence_gate_node)
     workflow.add_node("clarification", clarification_node)
     workflow.add_node("synthesizer", synthesizer_node)
@@ -50,7 +52,8 @@ def create_financial_agent_graph():
     )
     workflow.add_edge("ast_generator", "sql_compiler")
     workflow.add_edge("sql_compiler", "db_execution_and_iqr")
-    workflow.add_edge("db_execution_and_iqr", "confidence_gate")
+    workflow.add_edge("db_execution_and_iqr", "index_advisor")
+    workflow.add_edge("index_advisor", "confidence_gate")
 
     # 3. Conditional Branch from Confidence Gate
     workflow.add_conditional_edges(

@@ -2,7 +2,7 @@
 TBX FinOps Assistant - Anti-Hallucination Schema Validator Guardrail
 Validates and auto-corrects LLM-generated AST queries against live MySQL database schema.
 Uses RapidFuzz Levenshtein matching to heal near-miss column names, eliminates hallucinated
-fields, and binds queries to real database tables and columns.
+fields, and binds queries to real database tables and columns. Multi-tenant and session-aware.
 """
 
 from typing import Dict, Any, List, Optional, Set, Tuple
@@ -12,31 +12,31 @@ from backend.engine.db import db
 
 class SchemaValidator:
     def __init__(self):
-        self._cached_table_columns: Dict[str, Set[str]] = {}
+        pass
 
-    def get_valid_columns_for_table(self, table_name: str) -> Set[str]:
+    def get_valid_columns_for_table(self, table_name: str, session_id: Optional[str] = None) -> Set[str]:
         """Returns lowercase set of all valid column names for a given table or view, including joined tables."""
         table_clean = table_name.lower().strip()
-        profile = db.get_schema_profile()
+        profile = db.get_schema_profile(session_id)
         cols = set()
         
         if table_clean in profile:
             cols.update(profile[table_clean].keys())
         else:
-            # Check in live table introspection
-            tables = db.get_tables_and_views()
+            tables = db.get_tables_and_views(session_id)
             if table_clean in tables:
                 try:
                     df, _, _ = db.execute_query(
                         "SELECT column_name FROM information_schema.columns WHERE table_schema = DATABASE() AND LOWER(table_name) = %s",
-                        (table_clean,)
+                        (table_clean,),
+                        session_id=session_id
                     )
                     cols.update({str(c).lower() for c in df["column_name"].tolist()})
                 except Exception:
                     pass
 
         # Also include columns from foreign key joined tables to support dynamic joins
-        fks = db.get_foreign_keys()
+        fks = db.get_foreign_keys(session_id)
         for fk in fks:
             if fk["from_table"] == table_clean:
                 joined_table = fk["to_table"]
@@ -49,22 +49,26 @@ class SchemaValidator:
                     
         return cols
 
-    def resolve_target_table(self, requested_domain: str) -> str:
+    def resolve_target_table(self, requested_domain: str, session_id: Optional[str] = None) -> str:
         """Resolves target table/view name, supporting domain aliases and fuzzy matching."""
         req = (requested_domain or "transactions").lower().strip()
-        tables = db.get_tables_and_views()
+        tables = db.get_tables_and_views(session_id)
 
         # 1. Exact match
         if req in tables:
             return req
 
-        # 2. View vs Base Table preference
-        # Prefer analytical views if available (e.g. 'v_transactions' for 'transactions')
+        # 2. View vs Base Table preference (if views exist, like on default demo database)
         view_candidate = f"v_{req}"
         if view_candidate in tables:
             return view_candidate
 
-
+        # Singular form (e.g. transactions -> transaction)
+        singular = req[:-1] if req.endswith("s") else req
+        if singular in tables:
+            return singular
+        if f"v_{singular}" in tables:
+            return f"v_{singular}"
 
         # 3. Fuzzy match against all available tables and views
         all_names = list(tables.keys())
@@ -73,12 +77,11 @@ class SchemaValidator:
             if match and match[1] >= 70:
                 return match[0]
 
-        # Default fallback to first table or 'transactions'
         return all_names[0] if all_names else req
 
-    def auto_detect_metric_column(self, table_name: str) -> Optional[str]:
+    def auto_detect_metric_column(self, table_name: str, session_id: Optional[str] = None) -> Optional[str]:
         """Dynamically identifies the primary numeric column for aggregations in a table."""
-        profile = db.get_schema_profile()
+        profile = db.get_schema_profile(session_id)
         cols = profile.get(table_name.lower(), {})
 
         # 1. Priority financial column names
@@ -99,9 +102,9 @@ class SchemaValidator:
 
         return None
 
-    def auto_detect_date_column(self, table_name: str) -> Optional[str]:
+    def auto_detect_date_column(self, table_name: str, session_id: Optional[str] = None) -> Optional[str]:
         """Dynamically identifies the primary temporal column in a table."""
-        profile = db.get_schema_profile()
+        profile = db.get_schema_profile(session_id)
         cols = profile.get(table_name.lower(), {})
 
         # Priority temporal column names
@@ -126,9 +129,6 @@ class SchemaValidator:
         if col in valid_columns:
             return col
 
-
-
-        # Fuzzy string matching via RapidFuzz
         if valid_columns:
             match = process.extractOne(col, list(valid_columns), scorer=fuzz.token_set_ratio)
             if match and match[1] >= 75.0:
@@ -136,7 +136,7 @@ class SchemaValidator:
 
         return None
 
-    def validate_and_heal(self, ast: FinancialQueryAST) -> FinancialQueryAST:
+    def validate_and_heal(self, ast: FinancialQueryAST, session_id: Optional[str] = None) -> FinancialQueryAST:
         """
         Inspects, heals, and validates the entire AST against live MySQL schema.
         Prevents SQL injection, syntax crashes, and hallucinations.
@@ -144,18 +144,18 @@ class SchemaValidator:
         healed_ast = ast.model_copy(deep=True)
 
         # 1. Resolve target table/view
-        healed_table = self.resolve_target_table(healed_ast.target_domain)
+        healed_table = self.resolve_target_table(healed_ast.target_domain, session_id)
         healed_ast.target_domain = healed_table
-        valid_cols = self.get_valid_columns_for_table(healed_table)
+        valid_cols = self.get_valid_columns_for_table(healed_table, session_id)
 
         # 2. Resolve metric column
         if not healed_ast.metric_column or healed_ast.metric_column not in valid_cols:
-            auto_metric = self.auto_detect_metric_column(healed_table)
+            auto_metric = self.auto_detect_metric_column(healed_table, session_id)
             healed_ast.metric_column = auto_metric
 
         # 3. Resolve date column
         if not healed_ast.date_column or healed_ast.date_column not in valid_cols:
-            auto_date = self.auto_detect_date_column(healed_table)
+            auto_date = self.auto_detect_date_column(healed_table, session_id)
             healed_ast.date_column = auto_date
 
         # 4. Heal and validate entity filters
@@ -171,7 +171,6 @@ class SchemaValidator:
                     )
                 )
             else:
-                # Discard unresolvable hallucinated column
                 print(f"⚠️ Schema Validator: Dropped hallucinated filter field '{f.field}' for table '{healed_table}'")
 
         healed_ast.entity_filters = validated_filters
@@ -180,7 +179,6 @@ class SchemaValidator:
         validated_group_bys: List[str] = []
         for g in (healed_ast.group_by or []):
             g_clean = g.lower().strip()
-            # Special temporal groupings
             if g_clean in ["month", "year", "day"] and healed_ast.date_column:
                 if g_clean not in validated_group_bys:
                     validated_group_bys.append(g_clean)
@@ -191,7 +189,6 @@ class SchemaValidator:
                 validated_group_bys.append(resolved_col)
 
         healed_ast.group_by = validated_group_bys
-
         return healed_ast
 
 schema_validator = SchemaValidator()

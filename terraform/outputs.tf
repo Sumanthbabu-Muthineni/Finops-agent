@@ -22,3 +22,18 @@ output "cloudfront_distribution_id" {
   description = "CloudFront Distribution ID for cache invalidations"
   value       = aws_cloudfront_distribution.main.id
 }
+
+output "rds_mysql_endpoint" {
+  description = "MySQL RDS Endpoint"
+  value       = aws_db_instance.mysql.endpoint
+}
+
+output "rds_mysql_address" {
+  description = "MySQL RDS Hostname / Address"
+  value       = aws_db_instance.mysql.address
+}
+
+output "rds_mysql_port" {
+  description = "MySQL RDS Port"
+  value       = aws_db_instance.mysql.port
+}

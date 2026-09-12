@@ -80,6 +80,8 @@ class AuditTrail(BaseModel):
     execution_time_ms: float
     rows_scanned: int
     model_used: str
+    index_status: Optional[str] = None
+    advisories: List[str] = Field(default_factory=list)
 
 class ChatRequest(BaseModel):
     session_id: Optional[str] = None
@@ -95,3 +97,30 @@ class ChatResponse(BaseModel):
     table_data: List[Dict[str, Any]] = Field(default_factory=list)
     audit_trail: Optional[AuditTrail] = None
     clarification_options: Optional[List[str]] = None
+
+class ConnectDbRequest(BaseModel):
+    session_id: Optional[str] = None
+    host: str
+    port: int = 3306
+    user: Optional[str] = None
+    username: Optional[str] = None
+    password: str = ""
+    database: str
+    ssl: bool = False
+
+class ConnectDbResponse(BaseModel):
+    success: bool
+    session_id: str
+    database: str
+    host: str
+    port: int
+    tables_count: int
+    tables: List[str]
+    total_rows: int
+    advisor_report: Optional[Dict[str, Any]] = None
+    message: str
+
+class DisconnectDbResponse(BaseModel):
+    success: bool
+    session_id: str
+    message: str

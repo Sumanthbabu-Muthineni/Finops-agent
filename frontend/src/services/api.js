@@ -25,3 +25,24 @@ export const getVendors = async () => {
   const response = await api.get('/vendors');
   return response.data.vendors || [];
 };
+
+export const connectDatabase = async (config, sessionId) => {
+  const payload = { ...config, session_id: sessionId };
+  const response = await api.post('/db/connect', payload);
+  return response.data;
+};
+
+export const disconnectDatabase = async (sessionId) => {
+  const response = await api.post('/db/disconnect', { session_id: sessionId });
+  return response.data;
+};
+
+export const getDbStatus = async (sessionId) => {
+  const response = await api.get(`/db/status/${sessionId}`);
+  return response.data;
+};
+
+export const getDbAdvisor = async (sessionId) => {
+  const response = await api.get(`/db/advisor/${sessionId}`);
+  return response.data;
+};

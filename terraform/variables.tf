@@ -45,3 +45,22 @@ variable "max_capacity" {
   type        = number
   default     = 5
 }
+
+variable "db_name" {
+  description = "Database name"
+  type        = string
+  default     = "tiby_hackathon"
+}
+
+variable "db_user" {
+  description = "Database master username"
+  type        = string
+  default     = "tiby"
+}
+
+variable "db_password" {
+  description = "Database master password"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
