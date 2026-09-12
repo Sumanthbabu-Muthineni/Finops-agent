@@ -18,27 +18,38 @@ class DateRangeFilter(BaseModel):
     end_date: Optional[str] = Field(None, description="ISO format YYYY-MM-DD")
 
 class FinancialQueryAST(BaseModel):
-    target_domain: Literal["transactions", "accounts", "banks", "vendor_payouts"] = Field(
-        "transactions", description="Primary semantic domain view to query: transactions, accounts, banks"
+    target_domain: str = Field(
+        "transactions", description="Target database table or view name (e.g. v_transactions, transactions, accounts, orders)"
     )
-    target_metric: Literal["total_amount", "available_balance", "average_amount", "record_count", "records_list"] = Field(
+    target_metric: Literal[
+        "total_amount", "available_balance", "average_amount", "record_count", "records_list",
+        "sum", "average", "count", "min", "max"
+    ] = Field(
         "total_amount", description="Core aggregation metric or raw line items"
     )
+    metric_column: Optional[str] = Field(
+        None, description="Optional target numeric column to aggregate (e.g. transaction_amount, available_balance, amount)"
+    )
+    date_column: Optional[str] = Field(
+        None, description="Optional temporal column for date range filtering (e.g. transaction_date, created_at)"
+    )
     entity_filters: List[EntityFilter] = Field(
-        default_factory=list, description="Fuzzy/exact entity match constraints: bank_name, bank_code, transaction_type, program_id, etc."
+        default_factory=list, description="Column match constraints: column name, operator, and value"
     )
     date_range: Optional[DateRangeFilter] = Field(
         None, description="Normalized ISO date boundaries"
     )
     group_by: Optional[List[str]] = Field(
-        default_factory=list, description="Categorical or temporal grouping: transaction_type, bank_name, program_id, month"
+        default_factory=list, description="Categorical or temporal grouping columns"
     )
     order_by_desc: bool = Field(
-        True, description="Order results by metric/date descending"
+        True, description="Order results descending"
     )
     limit: int = Field(
         100, ge=1, le=1000, description="Max rows returned to prevent client overflow"
     )
+
+AnalyticalQueryAST = FinancialQueryAST
 
 # ------------------------------------------------------------------------------
 # 2. UI & API Response Contracts

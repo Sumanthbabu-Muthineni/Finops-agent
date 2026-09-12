@@ -35,43 +35,44 @@ class ConversationContextAgent:
             "Your job is to analyze the user's latest message in the context of recent conversation history to determine their intent, resolve conversational references, and output a structured JSON analysis.\n\n"
             f"Available Canonical Banks in Database:\n{json.dumps(canonical_banks)}\n\n"
             "CAPABILITIES & REASONING RULES:\n"
-            "1. MULTI-TURN CONFIRMATIONS / AFFIRMATIONS:\n"
+            "1. GENERAL GREETINGS & CHIT-CHAT:\n"
+            "   - If the user says hello ('hi', 'hello', 'hey', 'good morning', etc.), asks how you are ('how are you', 'how are you doing'), or asks who you are ('who are you', 'what can you do'):\n"
+            "     * Set intent = 'GREETING'\n"
+            "     * Set context_scope = 'GLOBAL'\n"
+            "     * Set resolved_bank = null\n"
+            "     * In conversational_reply, dynamically generate a warm, professional greeting explaining that you are an enterprise FinOps Banking Assistant ready to assist with account balances, transaction tracking, payouts, and financial analytics.\n"
+            "2. OUT OF SCOPE & PERSONAL QUESTIONS:\n"
+            "   - If the user asks personal questions (e.g. 'what is your name', 'do you have feelings', 'who made you', 'where do you live'), or asks about non-financial topics (e.g. weather, recipes, jokes, movies, sports, trivia):\n"
+            "     * Set intent = 'OUT_OF_SCOPE'\n"
+            "     * Set context_scope = 'GLOBAL'\n"
+            "     * Set resolved_bank = null\n"
+            "     * In conversational_reply, dynamically generate polite, professional feedback explaining that you are specialized in corporate financial operations and banking datasets, and politely steer them to ask finance and banking questions.\n"
+            "3. MULTI-TURN CONFIRMATIONS / AFFIRMATIONS:\n"
             "   - If the assistant previously asked for confirmation (e.g. 'Did you mean HDFC BANK LIMITED (HDFC)?') and the user confirms (e.g. 'yes', 'yes you are right', 'sure', 'correct', 'that one', 'proceed', 'go ahead'):\n"
             "     * Set intent = 'FINANCIAL'\n"
             "     * Set context_scope = 'SINGLE_ENTITY'\n"
             "     * Set resolved_bank to the confirmed bank (e.g. 'HDFC BANK LIMITED')\n"
             "     * Rewrite standalone_query to the user's original pending question with the confirmed bank name.\n"
-            "2. PRONOUNS & CONTEXT INHERITANCE:\n"
+            "4. PRONOUNS & CONTEXT INHERITANCE:\n"
             "   - If the user uses pronouns or references like 'them', 'their payouts', 'above bank', 'that bank', 'under above bank', identify which bank was discussed in the immediate previous turn and set resolved_bank to that bank.\n"
-            "3. CONTEXT SWITCHES & GLOBAL DATABASE INQUIRIES:\n"
+            "5. CONTEXT SWITCHES & GLOBAL DATABASE INQUIRIES:\n"
             "   - If the user asks a question about the entire database or switches away from a specific bank (e.g. 'how many rows you have in db', 'how many records in db', 'what is our overall spend', 'total balance across all accounts', 'in the database'):\n"
             "     * Set intent = 'FINANCIAL'\n"
             "     * Set context_scope = 'GLOBAL'\n"
             "     * Set resolved_bank = null (DO NOT keep the previous bank in context!)\n"
-            "     * Rewrite standalone_query to clearly express the global request (e.g. 'How many total rows or records are in the database across all accounts and transactions?').\n"
-            "4. WHO PAID / INCOMING PAYMENTS / CREDITOR DESCRIPTIONS:\n"
-            "   - When user asks 'who paid to <bank>', 'who paid us', or says 'in the description we have the creditor name. check and give':\n"
+            "     * Rewrite standalone_query to clearly express the global request.\n"
+            "6. FINANCIAL INQUIRIES / ACCOUNTS / PAYMENTS:\n"
+            "   - Any question about balances, transactions, spend, credits, debits, UTRs, or vendor payouts:\n"
             "     * Set intent = 'FINANCIAL'\n"
-            "     * Set context_scope = 'SINGLE_ENTITY'\n"
-            "     * Set resolved_bank to the relevant bank (e.g. 'HDFC BANK LIMITED')\n"
-            "     * Rewrite standalone_query to 'Show incoming credit transactions and check description for creditor names for <bank>'.\n"
-            "   - When user asks 'how many accounts we have under <bank>' or 'what accounts do we have under <bank>':\n"
-            "     * Set intent = 'FINANCIAL'\n"
-            "     * Set context_scope = 'SINGLE_ENTITY'\n"
-            "     * Set resolved_bank to the bank\n"
-            "     * Rewrite standalone_query to 'List all accounts, program IDs, and available balances under <bank>'.\n"
-            "5. RECORD & DATE DETAILS:\n"
-            "   - If the user asks what dates records occurred on (e.g. 'all these three records are on which date', 'when did this happen'):\n"
-            "     * Keep the relevant bank in scope.\n"
-            "     * Rewrite standalone_query to ask for the dates and details of those records without restricting to an arbitrary single date.\n"
-            "6. GENERAL GREETINGS & CHIT-CHAT:\n"
-            "   - If the user says hello, asks who you are, or asks for general help ('hi', 'hello', 'good morning', 'who are you', 'what can you do', 'help', 'thank you'):\n"
-            "     * Set intent = 'GREETING'\n"
-            "     * Provide a helpful, professional greeting in conversational_reply explaining your capabilities (bank accounts, available balances, transaction tracking, credit/debit breakdowns, reference lookups).\n"
-            "7. OUT OF SCOPE:\n"
-            "   - If the user asks about completely unrelated topics (weather, recipes, poems, jokes, general knowledge, movies, sports):\n"
-            "     * Set intent = 'OUT_OF_SCOPE'\n"
-            "     * Provide a polite conversational_reply explaining that you are specialized in corporate financial and banking datasets.\n\n"
+            "     * Identify the bank if mentioned or inherited, else null\n"
+            "     * Rewrite standalone_query into a clear, disambiguated statement.\n\n"
+            "FEW-SHOT EXAMPLES:\n"
+            "User: \"hi\"\n"
+            "Output: {\"intent\": \"GREETING\", \"context_scope\": \"GLOBAL\", \"resolved_bank\": null, \"standalone_query\": \"hi\", \"conversational_reply\": \"Hello! I am your enterprise FinOps Banking Assistant. I can help you analyze corporate bank accounts, check balances, and track financial transactions. How can I assist you today?\"}\n\n"
+            "User: \"how are you?\"\n"
+            "Output: {\"intent\": \"GREETING\", \"context_scope\": \"GLOBAL\", \"resolved_bank\": null, \"standalone_query\": \"how are you?\", \"conversational_reply\": \"I'm doing well, thank you! I am ready to assist you with your financial operations, bank accounts, and transaction records. How may I help you today?\"}\n\n"
+            "User: \"tell me a joke\"\n"
+            "Output: {\"intent\": \"OUT_OF_SCOPE\", \"context_scope\": \"GLOBAL\", \"resolved_bank\": null, \"standalone_query\": \"tell me a joke\", \"conversational_reply\": \"I am a specialized corporate FinOps Banking Assistant designed for financial data operations and reconciliations. Please ask me questions regarding your company accounts, balances, or transactions!\"}\n\n"
             "Output valid JSON ONLY matching this schema:\n"
             "{\n"
             "  \"intent\": \"FINANCIAL\" | \"GREETING\" | \"OUT_OF_SCOPE\",\n"
@@ -96,37 +97,51 @@ class ConversationContextAgent:
         if llm_client:
             try:
                 raw = llm_client.complete(user_content, system_prompt)
-                match = re.search(r'\{.*\}', raw, re.DOTALL)
-                json_str = match.group(0) if match else raw
+                clean_raw = raw.strip() if raw else ""
+                if "```json" in clean_raw:
+                    clean_raw = clean_raw.split("```json")[1].split("```")[0].strip()
+                elif "```" in clean_raw:
+                    clean_raw = clean_raw.split("```")[1].split("```")[0].strip()
+
+                match = re.search(r'\{.*\}', clean_raw, re.DOTALL)
+                json_str = match.group(0) if match else clean_raw
                 parsed = json.loads(json_str)
 
-                intent = parsed.get("intent", "FINANCIAL").upper()
+                intent = str(parsed.get("intent") or "FINANCIAL").strip().upper()
                 if intent not in ["FINANCIAL", "GREETING", "OUT_OF_SCOPE"]:
                     intent = "FINANCIAL"
 
-                scope = parsed.get("context_scope", "SINGLE_ENTITY").upper()
+                raw_scope = parsed.get("context_scope")
+                scope = str(raw_scope).strip().upper() if raw_scope else "SINGLE_ENTITY"
                 if scope not in ["SINGLE_ENTITY", "GLOBAL"]:
                     scope = "GLOBAL" if "global" in str(parsed).lower() else "SINGLE_ENTITY"
 
                 bank = parsed.get("resolved_bank")
-                if bank and not any(bank.upper() == b.upper() for b in canonical_banks):
+                if bank and not any(str(bank).upper() == b.upper() for b in canonical_banks):
                     # Check fuzzy match against canonical banks
                     from rapidfuzz import process, fuzz
-                    m = process.extractOne(bank, canonical_banks, scorer=fuzz.token_set_ratio)
+                    m = process.extractOne(str(bank), canonical_banks, scorer=fuzz.token_set_ratio)
                     bank = m[0] if m and m[1] >= 75 else None
 
                 sq = parsed.get("standalone_query") or clean_q
                 cr = parsed.get("conversational_reply")
 
+                # Default fallback reply if LLM categorized as GREETING / OUT_OF_SCOPE but omitted text
+                if intent == "GREETING" and not cr:
+                    cr = "Hello! I am your enterprise FinOps Banking Assistant. How can I assist you with your financial operations, bank accounts, or transaction records today?"
+                elif intent == "OUT_OF_SCOPE" and not cr:
+                    cr = "I am an enterprise FinOps Banking Assistant specialized in corporate banking datasets, account balances, and financial transactions. Please feel free to ask any finance-related questions!"
+
                 return ConversationResolution(
                     intent=intent,
                     context_scope=scope,
                     resolved_bank=bank,
-                    standalone_query=sq,
+                    standalone_query=str(sq),
                     conversational_reply=cr
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(f"LLM intent resolution parsing failed: {e}. Raw: {raw if 'raw' in locals() else None}")
 
         # 2. Intelligent Deterministic Fallback (for testing / offline)
         return self._deterministic_fallback(clean_q, history, active_context_vendor, canonical_banks)
@@ -140,25 +155,8 @@ class ConversationContextAgent:
     ) -> ConversationResolution:
         lower = query.lower().strip()
 
-        # Check Greetings
-        greetings = ["hi", "hello", "hey", "good morning", "good evening", "who are you", "what can you do", "help"]
-        if any(lower == g or lower.startswith(g + " ") for g in greetings) and not any(w in lower for w in ["balance", "spend", "transaction", "bank", "account", "row", "record"]):
-            sample_bank = canonical_banks[0] if canonical_banks else "HDFC BANK LIMITED"
-            reply = (
-                "Hello! How can I assist you with your banking and financial operations today?\n\n"
-                "You can ask me about:\n"
-                f"• **Available Balances**: *'What is our total available balance across all banks?'*\n"
-                f"• **Bank Accounts**: *'How many accounts do we have under {sample_bank}?'*\n"
-                "• **Transaction Volumes**: *'How much was credited vs debited in June 2026?'*\n"
-                "• **Reference ID Lookup**: *'Lookup transaction reference 1715499972'*."
-            )
-            return ConversationResolution(
-                intent="GREETING",
-                context_scope="GLOBAL",
-                resolved_bank=None,
-                standalone_query=query,
-                conversational_reply=reply
-            )
+        # Deterministic fallback handles ONLY core financial scoping logic.
+        # Greetings and personal/out-of-scope intent classification is now handled purely by the LLM Intent Agent.
 
         # Check Affirmations after clarification
         last_asst = history[-1]["content"] if history and history[-1].get("role") == "assistant" else ""
@@ -169,11 +167,16 @@ class ConversationContextAgent:
         ])
 
         if is_affirmation and "Did you mean" in last_asst:
-            # Extract suggested bank from assistant message
+            # Extract suggested entity from assistant message
             for b in canonical_banks:
                 if b.lower() in last_asst.lower():
                     prev_user_q = history[-2]["content"] if len(history) >= 2 and history[-2].get("role") == "user" else f"Show balance for {b}"
-                    sq = re.sub(r"\b(hdfc|sbi|icici|axis|kotak|canara|aubl)\b", b, prev_user_q, flags=re.IGNORECASE)
+                    sq = prev_user_q
+                    from backend.core.entity_resolver import entity_resolver
+                    aliases = list(entity_resolver.dynamic_aliases.keys())
+                    if aliases:
+                        pattern = r"\b(" + "|".join(re.escape(a) for a in sorted(aliases, key=len, reverse=True)) + r")\b"
+                        sq = re.sub(pattern, b, sq, flags=re.IGNORECASE)
                     if b.lower() not in sq.lower():
                         sq += f" for {b}"
                     return ConversationResolution(
@@ -268,26 +271,6 @@ class ConversationContextAgent:
                     standalone_query=query,
                     conversational_reply=None
                 )
-
-        # Out-of-scope check
-        if any(w in lower for w in ["weather", "joke", "poem", "recipe", "capital of", "president", "movie"]):
-            v1 = canonical_banks[0] if canonical_banks else "HDFC BANK LIMITED"
-            reply = (
-                "I am specifically designed to assist with **company financial & banking operations** "
-                "(bank accounts, available balances, transaction tracking, credit/debit breakdowns, and reference searches).\n\n"
-                "I cannot assist with general knowledge or unrelated topics. Please ask a question related to your financial datasets, for example:\n"
-                "• **'What is our total available balance across all banks?'**\n"
-                "• **'How much was credited vs debited in June 2026?'**\n"
-                f"• **'What is our balance at {v1}?'**\n"
-                "• **'Lookup transaction reference 1715499972'**"
-            )
-            return ConversationResolution(
-                intent="OUT_OF_SCOPE",
-                context_scope="GLOBAL",
-                resolved_bank=None,
-                standalone_query=query,
-                conversational_reply=reply
-            )
 
         return ConversationResolution(
             intent="FINANCIAL",

@@ -135,3 +135,8 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# Local scratch test scripts
+test_db.py
+test_db2.py
+test_mysql.py

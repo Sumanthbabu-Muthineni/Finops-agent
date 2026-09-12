@@ -98,6 +98,32 @@ class GroqClient(BaseLLMClient):
 class MockLLMClient(BaseLLMClient):
     """Deterministic, zero-latency 8B emulator for automated testing and offline development."""
     def complete(self, prompt: str, system: str = "") -> str:
+        # If this is an intent classification request from Conversation Agent
+        if "Intent Agent" in system or "intent" in system.lower():
+            lower_p = prompt.lower()
+            intent = "FINANCIAL"
+            cr = None
+            if re.search(r"\b(hi|hello|hey|how are you|how are you doing|what'?s up|whats up|good morning|good afternoon|good evening|who are you)\b", lower_p):
+                intent = "GREETING"
+                cr = "Hello! I am your enterprise FinOps Banking Assistant. I specialize in financial reporting and analysis. How can I assist you with your banking datasets today?"
+            elif any(w in lower_p for w in ["weather", "joke", "poem", "recipe", "capital of", "movie", "president", "sports", "how old", "where do you live", "favorite"]):
+                intent = "OUT_OF_SCOPE"
+                cr = "I am specifically designed to assist with company financial and banking operations. I cannot assist with personal or general knowledge questions. Please ask me about your financial datasets!"
+            
+            # Simple fallback extraction of the user query
+            sq = prompt
+            if "Current User Message:" in prompt:
+                sq = prompt.split("Current User Message:")[-1].strip().strip('"\n ')
+                
+            return json.dumps({
+                "intent": intent,
+                "context_scope": "GLOBAL",
+                "resolved_bank": None,
+                "standalone_query": sq,
+                "conversational_reply": cr
+            })
+
+        # Otherwise, assume this is an AST Generation request
         from backend.engine.db import db
         from backend.core.entity_resolver import entity_resolver
         from datetime import datetime, timedelta
@@ -342,81 +368,40 @@ class LLMAdapter:
     ) -> FinancialQueryAST:
         from backend.engine.db import db
         anchor = anchor_date or db.get_anchor_date()
-        canonical_banks = db.get_distinct_entities().get("banks", [])
-        schema_profile = db.get_schema_profile()
+        schema_context = db.get_schema_prompt_context()
 
         system_prompt = (
-            "You are a strict Financial AST Generator for an 8B model. "
-            "Convert natural language banking queries into a typed JSON Abstract Syntax Tree.\n"
-            f"The evaluation anchor date for 'today/now' is {anchor}.\n"
-            f"Available canonical banks: {json.dumps(canonical_banks)}.\n"
-            f"Database Schema Profile (Available domains, columns, data types, and sample values):\n"
-            f"{json.dumps(schema_profile, indent=2)}\n\n"
-            "SCHEMA-DRIVEN REASONING & MULTI-TURN PRINCIPLES (from TBX Database Schema):\n"
-            "1. DATABASE SCHEMA & ENTITY ROLES:\n"
-            "   - 'bank_name' / 'bank_code': The corporate partner bank where our accounts reside (e.g. 'HDFC BANK LIMITED', 'STATE BANK OF INDIA'). Banks are NEVER vendors or creditors!\n"
-            "   - 'account': Corporate accounts under specific programs (e.g. Program 21, Program 04) with masked numbers and available balances.\n"
-            "   - 'description': Free text in 'transactions' containing the actual CREDITOR, VENDOR, PAYEE, or COUNTERPARTY (e.g. 'SELECTION MOBILE', 'RELIANCE DIGITAL', 'BAJAJ FINANCE', 'PARESH VIKRANT GHASE', 'SELECTRICITY TWO PRIVATE LIMITED').\n"
-            "2. TARGET DOMAINS:\n"
-            "   - 'transactions': for payments, inflows, outflows, debits, credits, transfers, transaction dates, descriptions, who paid/was paid, or reference ID lookups.\n"
-            "   - 'accounts': for available balances, account lists ('how many accounts under HDFC', 'which accounts'), program IDs, or negative balance checks.\n"
-            "   - 'banks': for high-level bank totals across accounts.\n"
-            "3. INCOMING VS OUTGOING TRANSFERS & CREDITOR INQUIRIES:\n"
-            "   - When user asks 'who paid to <bank>', 'who paid us', or asks for creditors/incoming payments:\n"
-            "     * target_domain: 'transactions'\n"
-            "     * target_metric: 'records_list'\n"
-            "     * entity_filters: [{\"field\": \"bank_name\", \"operator\": \"eq\", \"value\": \"<bank>\"}, {\"field\": \"transaction_type\", \"operator\": \"eq\", \"value\": \"credit\"}]\n"
-            "     * CRITICAL: NEVER add a filter on 'description' for the bank name! The bank is in 'bank_name'. The creditor is in the 'description' field of each transaction.\n"
-            "   - When user asks 'who did we pay', 'payments to vendors', or 'payouts from <bank>':\n"
-            "     * target_domain: 'transactions'\n"
-            "     * target_metric: 'records_list'\n"
-            "     * entity_filters: [{\"field\": \"bank_name\", \"operator\": \"eq\", \"value\": \"<bank>\"}, {\"field\": \"transaction_type\", \"operator\": \"eq\", \"value\": \"debit\"}]\n"
-            "   - When user says 'in the description we have the creditor name' or asks for description details:\n"
-            "     * target_domain: 'transactions'\n"
-            "     * target_metric: 'records_list'\n"
-            "     * DO NOT filter 'description' on the bank name!\n"
-            "4. ACCOUNT LISTING INQUIRIES:\n"
-            "   - When user asks 'how many accounts we have under <bank>', 'show accounts for <bank>', 'which accounts under <bank>':\n"
-            "     * target_domain: 'accounts'\n"
-            "     * target_metric: 'records_list'\n"
-            "     * entity_filters: [{\"field\": \"bank_name\", \"operator\": \"eq\", \"value\": \"<bank>\"}]\n"
-            "5. DIRECTIONALITY & TRANSACTION TYPES:\n"
-            "   - For spending, payments, expenses, debits, or outflows: add entity_filter {\"field\": \"transaction_type\", \"operator\": \"eq\", \"value\": \"debit\"}.\n"
-            "   - For received money, inflows, credits, or deposits: add entity_filter {\"field\": \"transaction_type\", \"operator\": \"eq\", \"value\": \"credit\"}.\n"
-            "   - When comparing credit vs debit (e.g. 'credit and debit', 'credited vs debited'): DO NOT filter on transaction_type. Set group_by to [\"transaction_type\"] and target_metric to \"total_amount\" so both types are returned.\n"
-            "6. GROUPING & BREAKDOWNS:\n"
-            "   - When the user asks for amounts or balances by company, vendor, partner, entity, or bank (e.g. 'with respect to each company', 'by company', 'by bank'), ALWAYS set group_by to [\"bank_name\"].\n"
-            "   - NEVER group by 'entity_id'. 'entity_id' is an internal raw UUID foreign key. Companies are represented by 'bank_name' (e.g. 'HDFC BANK LIMITED').\n"
-            "   - When comparing across programs, set group_by to [\"program_id\"].\n"
-            "   - For spending trends over time ('spend trend', 'trend over last X months'): set group_by to [\"month\"].\n"
-            "7. KEYWORD & PAYEE MATCHING (DESCRIPTION COLUMN):\n"
-            "   - When the user asks about a specific merchant, person, category, or payee (e.g. 'Swiggy', 'Paresh', 'subscriptions', 'GST', 'Selection Mobile', 'Selection Electronics') that is not a canonical bank name, filter on 'description' with operator 'like':\n"
-            "     {\"field\": \"description\", \"operator\": \"like\", \"value\": \"<keyword>\"}.\n"
-            "   - CRITICAL: ONLY filter on 'description' when an explicit merchant or payee name is mentioned. If NO specific merchant or payee is mentioned, DO NOT add any filter on 'description'. NEVER put the full user question or query into 'description'.\n"
-            "8. NUMERIC THRESHOLDS & ACCOUNT BALANCE FILTERS:\n"
-            "   - When filtering by transaction amount (e.g. 'spend more than 10000', 'transactions over 200,000 INR'): add entity_filter {\"field\": \"transaction_amount\", \"operator\": \"gt\", \"value\": <number>}.\n"
-            "   - For accounts with negative balance ('negative balance'): set target_domain to 'accounts', target_metric to 'records_list', and add filter {\"field\": \"available_balance\", \"operator\": \"lt\", \"value\": 0}.\n"
-            "   - When the user inquires about available balance, set target_domain to 'accounts' and target_metric to 'available_balance'.\n"
-            "9. TEMPORAL & CALENDAR EXPRESSIONS (Anchor: " + str(anchor) + "):\n"
-            "   - 'this month': start of current month to end of current month.\n"
+            "You are a strict, schema-driven Analytical AST Generator for an 8B model.\n"
+            "Convert natural language user queries into a typed JSON Abstract Syntax Tree.\n"
+            f"The evaluation anchor date for 'today/now' is {anchor}.\n\n"
+            f"{schema_context}\n\n"
+            "CORE REASONING RULES:\n"
+            "1. SCHEMA GROUNDING:\n"
+            "   - 'target_domain': select the most relevant table or view name from the schema above (e.g. 'v_transactions', 'transactions', 'v_accounts', 'accounts', 'v_banks', 'bank').\n"
+            "   - 'entity_filters': use ONLY real column names present in the chosen table/view. For string values, use the sample categorical values provided in the schema where applicable.\n"
+            "   - NEVER hallucinate non-existent table or column names.\n"
+            "2. TARGET METRIC & OPERATIONS:\n"
+            "   - 'total_amount': when the user asks for total, spend, volume, balance, or sum.\n"
+            "   - 'record_count': when the user asks 'how many', 'count', 'number of transactions', 'how many rows in db', or sizing.\n"
+            "   - 'average_amount': when the user asks for average or mean.\n"
+            "   - 'records_list': when the user asks to 'list', 'show all', 'which', or lookup individual records or reference IDs.\n"
+            "3. GROUPING & BREAKDOWNS:\n"
+            "   - When comparing or breaking down across categories (e.g. 'by company', 'by bank', 'by type', 'credit vs debit', 'by program'), set 'group_by' to the matching column name (e.g. ['bank_name'], ['transaction_type'], ['program_id']).\n"
+            "   - For spending trends over time ('monthly trend', 'over time'), add 'month' or 'year' to 'group_by'.\n"
+            "4. TEMPORAL BOUNDARIES (Evaluation Anchor: " + str(anchor) + "):\n"
+            "   - 'this month': start of current anchor month to end of anchor month.\n"
             "   - 'last month': start of previous month to end of previous month.\n"
-            "   - 'last 3 months' / 'last 6 months': N months prior to anchor date to anchor date.\n"
-            "   - Exact date (e.g. 'February 29, 2024'): set start_date and end_date to '2024-02-29'.\n"
-            "   - Month-Year (e.g. 'Jan 2024', 'December 2025'): set start_date to 1st and end_date to last day of that month.\n"
-            "   - Holiday intervals (e.g. 'Christmas and New Year\\'s Eve of 2025'): set start_date to '2025-12-25', end_date to '2025-12-31'.\n"
-            "   - Specific year (e.g. 'year 2020', 'this year'): 'YYYY-01-01' to 'YYYY-12-31'.\n"
-            "10. RECORD LISTINGS & REFERENCE LOOKUPS:\n"
-            "   - When the user asks to 'list', 'show all', 'which accounts', or lookup records, set target_metric to 'records_list'.\n"
-            "   - If the user provides a reference receipt number (e.g. '1715499972'), add an entity_filter on 'transaction_reference_id'.\n"
-            "11. SENSITIVE DATA MASKING & MULTI-TURN:\n"
-            "   - Never expose unmasked raw account numbers. Accounts are referenced by masked number (e.g. ending in 9069).\n"
-            "   - Inherit previous turn's date_range and bank filters when user asks follow-up questions in the same session.\n"
-            "   - If user asks for 'all entities', 'all banks', or 'across all', do not filter on a single bank.\n\n"
+            "   - 'last 3 months': 3 months prior to anchor date to anchor date.\n"
+            "   - Exact date or month-year: format ISO YYYY-MM-DD boundaries in 'date_range'.\n"
+            "5. NUMERIC THRESHOLDS:\n"
+            "   - When filtering by amount (e.g. 'more than 10000', 'over 50000'): add entity_filter with operator 'gt', 'lt', 'gte', or 'lte'.\n\n"
             "Output valid JSON ONLY matching the FinancialQueryAST schema:\n"
             "{\n"
-            "  \"target_domain\": \"transactions\" | \"accounts\" | \"banks\",\n"
+            "  \"target_domain\": string,\n"
             "  \"target_metric\": \"total_amount\" | \"available_balance\" | \"average_amount\" | \"record_count\" | \"records_list\",\n"
-            "  \"entity_filters\": [{\"field\": string, \"operator\": \"eq\", \"value\": any}],\n"
+            "  \"metric_column\": string | null,\n"
+            "  \"date_column\": string | null,\n"
+            "  \"entity_filters\": [{\"field\": string, \"operator\": \"eq\" | \"neq\" | \"in\" | \"like\" | \"gt\" | \"lt\" | \"gte\" | \"lte\", \"value\": any}],\n"
             "  \"date_range\": {\"start_date\": \"YYYY-MM-DD\", \"end_date\": \"YYYY-MM-DD\"} | null,\n"
             "  \"group_by\": string[],\n"
             "  \"order_by_desc\": true,\n"
@@ -571,34 +556,20 @@ class LLMAdapter:
                 max_db_dt = db.get_max_dataset_date()
 
                 system_prompt = (
-                    "You are the executive FinOps AI Assistant for Corporate Banking & Treasury.\n"
+                    "You are the executive Analytical AI Assistant for Financial Operations.\n"
                     "Your goal is to write a clear, professional natural language narrative answering the user's financial question based ONLY on the grounded database facts provided below.\n\n"
-                    "SCHEMA ROLES & DATA ALIGNMENT:\n"
-                    "- BANK (bank_name): The corporate partner bank where our accounts are held (e.g. 'HDFC BANK LIMITED', 'AXIS BANK LIMITED'). Never call banks 'vendors' or 'creditors'.\n"
-                    "- ACCOUNT: Our corporate bank accounts under specific programs (e.g. Program 21, Program 04) with masked numbers and available balances.\n"
-                    "- TRANSACTION: Transaction ledger entries with transaction_type ('credit' = inflows/received payments, 'debit' = outflows/disbursements).\n"
-                    "- DESCRIPTION: Free text containing the actual CREDITOR, VENDOR, PAYEE, or COUNTERPARTY name and transfer particulars.\n\n"
                     "CRITICAL PRINCIPLES:\n"
-                    "1. ZERO MATH: All numbers, balances, totals, counts, and averages provided are exact and pre-computed by PostgreSQL. Use them exactly as given. Do NOT attempt to calculate, sum, subtract, or re-estimate any numbers.\n"
+                    "1. ZERO MATH: All numbers, balances, totals, counts, and averages provided are exact and pre-computed by the relational database engine. Use them exactly as given. Do NOT attempt to calculate, sum, subtract, or re-estimate any numbers.\n"
                     "2. ACCURATE ENTITY NAMES & SCOPE:\n"
-                    "   - Use the exact company or bank name from the database. Never output internal UUIDs.\n"
-                    "   - If 'Scope: Company-Wide' is provided, state clearly that figures represent company-wide totals across all partner banks and corporate accounts in the database. NEVER attribute company-wide totals to an individual bank.\n"
-                    "3. HANDLING 'WHO PAID TO <BANK>' / INCOMING PAYMENTS / CREDITOR INQUIRIES:\n"
-                    "   - When answering 'who paid to <bank>', 'who credited us', or creditor queries, inspect the 'description' field of the sample transactions provided.\n"
-                    "   - Extract and list the actual payer / creditor names, amounts, and dates from the descriptions (e.g. 'SELECTRICITY TWO PRIVATE LIMITED', 'SELECTION ELECTRONICS', 'SELECTION MALIGAI', etc.).\n"
-                    "   - NEVER say the bank was the recipient or payee! The bank is our depository account where funds were received.\n"
-                    "4. HANDLING 'HOW MANY ACCOUNTS UNDER <BANK>' / ACCOUNT LISTS:\n"
-                    "   - When answering how many accounts exist under a bank, or listing accounts, detail each corporate account from the facts:\n"
-                    "     * Masked Account Number, Program ID, and Available Balance.\n"
-                    "   - Conclude with the Total Available Balance across all accounts.\n"
-                    "5. DOMAIN & UNIT INTEGRITY (ACCOUNTS VS TRANSACTIONS):\n"
-                    "   - Bank accounts hold balances, while transactions represent ledger entries.\n"
-                    "   - If facts specify bank accounts, ALWAYS refer to them as 'bank accounts' or 'accounts'. NEVER call bank accounts 'transactions'.\n"
-                    "   - DATABASE SIZING: When the user asks 'how many rows in db' or about total records, report that the database contains 25,010 transactions across 13 accounts in 10 partner banks.\n"
-                    "6. STRUCTURE & FORMATTING:\n"
-                    "   - Use clean markdown bullet points for multi-account or multi-transaction breakdowns.\n"
+                    "   - Use the exact entity names from the database facts.\n"
+                    "   - If 'Scope: Entire Database' is provided, state clearly that figures represent totals across all records in the database.\n"
+                    "3. DOMAIN & UNIT INTEGRITY:\n"
+                    "   - When reporting counts or lists, use the Metric Unit Type and pre-calculated numbers provided in the facts.\n"
+                    "   - Never invent or hardcode row counts; rely strictly on the pre-calculated count in the facts.\n"
+                    "4. STRUCTURE & FORMATTING:\n"
+                    "   - Use clean markdown bullet points for breakdowns.\n"
                     "   - If a requested time period has no records because data ends earlier, explain the machine date and latest dataset date.\n"
-                    "7. TONE: Direct, professional, concise, executive-grade. Avoid conversational fluff."
+                    "5. TONE: Direct, professional, concise, executive-grade. Avoid conversational fluff."
                 )
 
                 facts = []
@@ -607,9 +578,9 @@ class LLMAdapter:
                 facts.append(f"Latest Recorded Transaction in Database: {max_db_dt}")
 
                 if resolved_vendor:
-                    facts.append(f"Partner Bank: {resolved_vendor}")
+                    facts.append(f"Target Entity: {resolved_vendor}")
                 else:
-                    facts.append("Scope: Company-Wide (All 10 Partner Banks & 13 Corporate Accounts)")
+                    facts.append("Scope: Entire Database")
 
                 unit_label = unit or "records"
                 facts.append(f"Metric Unit Type: {unit_label}")

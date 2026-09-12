@@ -1,11 +1,5 @@
 """
-TBX FinOps Assistant - High-Speed PostgreSQL Bulk Seeder
-Populates PostgreSQL directly with:
-1. Official 10 sample banks from 'TBX - Database Schema.md'
-2. Official sample accounts + accounts covering all 10 banks
-3. Official sample transactions + rich multi-month transactions (2025-2026)
-4. Intentional IQR statistical outliers ($1,850,000 debit)
-Uses PostgreSQL streaming binary/CSV COPY for maximum insertion throughput.
+TBX FinOps Assistant - MySQL Bulk Seeder
 """
 
 import os
@@ -23,11 +17,18 @@ import random
 import uuid
 import time
 from datetime import datetime, timedelta
-import psycopg2
-from psycopg2.extras import execute_values
+from dotenv import load_dotenv
+load_dotenv()
+
+import pymysql
 from backend.core.crypto import encrypt_utr
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/finops")
+# MySQL connection parameters loaded strictly from .env
+DB_HOST = os.getenv("MYSQL_HOST", "localhost")
+DB_PORT = int(os.getenv("MYSQL_PORT", 3306))
+DB_USER = os.getenv("MYSQL_USER")
+DB_PASSWORD = os.getenv("MYSQL_PASSWORD")
+DB_NAME = os.getenv("MYSQL_DB")
 
 SAMPLE_BANKS = [
     ("HDFC", "HDFC BANK LIMITED"),
@@ -72,34 +73,43 @@ SAMPLE_TRANSACTIONS = [
 ]
 
 def seed_database(scale_count: int = 10000):
-    print(f"🚀 Connecting to PostgreSQL at {DATABASE_URL}...")
-    conn = psycopg2.connect(DATABASE_URL)
+    print(f"🚀 Connecting to MySQL at {DB_HOST}:{DB_PORT}...")
+    conn = pymysql.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        database=DB_NAME,
+        autocommit=True
+    )
     cur = conn.cursor()
 
     t_start = time.time()
 
-    # 1. Seed Banks
     print("1. Seeding banks...")
-    cur.execute("DELETE FROM transaction;")
-    cur.execute("DELETE FROM account;")
-    cur.execute("DELETE FROM bank;")
-    execute_values(cur, "INSERT INTO bank (bank_code, bank_name) VALUES %s ON CONFLICT DO NOTHING;", SAMPLE_BANKS)
+    cur.execute("SET FOREIGN_KEY_CHECKS = 0;")
+    cur.execute("TRUNCATE TABLE transaction;")
+    cur.execute("TRUNCATE TABLE account;")
+    cur.execute("TRUNCATE TABLE bank;")
+    cur.execute("SET FOREIGN_KEY_CHECKS = 1;")
+    
+    cur.executemany(
+        "INSERT IGNORE INTO bank (bank_code, bank_name) VALUES (%s, %s)", 
+        SAMPLE_BANKS
+    )
 
-    # 2. Seed Accounts
     print("2. Seeding accounts...")
     acc_rows = []
     for a in SAMPLE_ACCOUNTS:
         acc_rows.append((a[0], a[1], a[2], a[5], a[3], a[4]))
-    execute_values(cur, """
-        INSERT INTO account (account_id, entity_id, account_number, bank_code, program_id, available_balance)
-        VALUES %s ON CONFLICT DO NOTHING;
+    cur.executemany("""
+        INSERT IGNORE INTO account (account_id, entity_id, account_number, bank_code, program_id, available_balance)
+        VALUES (%s, %s, %s, %s, %s, %s)
     """, acc_rows)
 
-    # Build account lookup
     account_lookup = {a[0]: {"entity_id": a[1], "program_id": a[3]} for a in SAMPLE_ACCOUNTS}
     account_ids = list(account_lookup.keys())
 
-    # 3. Insert Canonical Transactions
     print("3. Inserting official canonical sample transactions...")
     canon_rows = []
     for t in SAMPLE_TRANSACTIONS:
@@ -110,16 +120,13 @@ def seed_database(scale_count: int = 10000):
             t[0], acc_id, acc_meta["entity_id"], acc_meta["program_id"],
             t[2], t[3], t[5], t[4], t[6], encrypted_utr
         ))
-    execute_values(cur, """
+    cur.executemany("""
         INSERT INTO transaction (transaction_id, account_id, entity_id, program_id, transaction_date, transaction_type, transaction_amount, description, transaction_reference_id, utr_number)
-        VALUES %s;
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """, canon_rows)
 
-    # 4. Stream High-Volume Realistic Synthetic Transactions via COPY
-    print(f"4. Bulk streaming {scale_count:,} realistic multi-month transactions using PostgreSQL COPY...")
-    f_buffer = io.StringIO()
-    writer = csv.writer(f_buffer, delimiter="\t")
-
+    print(f"4. Bulk inserting {scale_count:,} realistic multi-month transactions...")
+    
     start_dt = datetime(2025, 10, 1)
     end_dt = datetime(2026, 6, 24, 18, 0, 0)
     total_seconds = int((end_dt - start_dt).total_seconds())
@@ -136,6 +143,7 @@ def seed_database(scale_count: int = 10000):
     ]
 
     random.seed(42)
+    bulk_rows = []
     for i in range(scale_count):
         t_id = str(uuid.uuid4())
         acc_id = random.choice(account_ids)
@@ -143,7 +151,6 @@ def seed_database(scale_count: int = 10000):
         dt = start_dt + timedelta(seconds=random.randint(0, total_seconds))
         dt_str = dt.strftime("%Y-%m-%d %H:%M:%S")
 
-        # Anomaly trigger: intentional $1,850,000 debit in June 2026
         if i == 42:
             txn_type = "debit"
             amt = 1850000.00
@@ -163,18 +170,25 @@ def seed_database(scale_count: int = 10000):
         raw_utr = f"jhI5nAdy{random.randint(100000, 999999)}"
         encrypted_utr = encrypt_utr(raw_utr)
 
-        writer.writerow([
+        bulk_rows.append((
             t_id, acc_id, meta["entity_id"], meta["program_id"],
             dt_str, txn_type, amt, desc, ref_id, encrypted_utr
-        ])
+        ))
 
-    f_buffer.seek(0)
-    cur.copy_expert("""
-        COPY transaction (transaction_id, account_id, entity_id, program_id, transaction_date, transaction_type, transaction_amount, description, transaction_reference_id, utr_number)
-        FROM STDIN WITH (FORMAT CSV, DELIMITER E'\t');
-    """, f_buffer)
+        # Batch insert every 5000 rows
+        if len(bulk_rows) >= 5000:
+            cur.executemany("""
+                INSERT INTO transaction (transaction_id, account_id, entity_id, program_id, transaction_date, transaction_type, transaction_amount, description, transaction_reference_id, utr_number)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, bulk_rows)
+            bulk_rows = []
 
-    conn.commit()
+    if bulk_rows:
+        cur.executemany("""
+            INSERT INTO transaction (transaction_id, account_id, entity_id, program_id, transaction_date, transaction_type, transaction_amount, description, transaction_reference_id, utr_number)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, bulk_rows)
+
     elapsed = round(time.time() - t_start, 2)
 
     cur.execute("SELECT COUNT(*) FROM transaction;")
@@ -187,7 +201,7 @@ def seed_database(scale_count: int = 10000):
     cur.close()
     conn.close()
 
-    print(f"🎉 PostgreSQL Seeding Completed in {elapsed}s!")
+    print(f"🎉 MySQL Seeding Completed in {elapsed}s!")
     print(f"   • Banks:        {total_banks}")
     print(f"   • Accounts:     {total_accs}")
     print(f"   • Transactions: {total_txns:,}")

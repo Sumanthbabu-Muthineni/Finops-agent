@@ -60,7 +60,7 @@ export default function App() {
       console.error("API error:", error);
       const errorMsg = {
         role: 'assistant',
-        narrative: "An error occurred while processing your request. Please ensure the backend server is running on port 8000.",
+        narrative: "An error occurred while processing your request. Please ensure the backend server is running and accessible.",
         confidence: { score: 0.0, tier: 'LOW', explanation: 'Network/Server Error' },
         anomaly: { detected: false },
         summary_metrics: [],
@@ -95,7 +95,7 @@ export default function App() {
         <div className="header-badges">
           <div className="status-badge" title="Underlying Relational Database">
             <span className="pulse-dot"></span>
-            <span>PostgreSQL Active</span>
+            <span>MySQL 8.0 Active</span>
           </div>
 
           <div className="status-badge" title="Model Efficiency Rubric">
@@ -119,7 +119,7 @@ export default function App() {
             </div>
             <h1>Ask Any Financial Operations Question</h1>
             <p>
-              Grounded, zero-hallucination answers powered by PostgreSQL analytics, automated IQR outlier detection, and dynamic schema inspection.
+              Grounded, zero-hallucination answers powered by MySQL 8.0 analytics, automated IQR outlier detection, and dynamic schema inspection.
             </p>
 
             <div className="sample-questions-grid">
@@ -153,7 +153,7 @@ export default function App() {
               <div className="assistant-bubble" style={{ padding: '12px 18px' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                   <span style={{ fontSize: '0.85rem', color: '#94a3b8' }}>
-                    Compiling query & executing in PostgreSQL...
+                    Compiling query & executing in MySQL 8.0...
                   </span>
                   <div className="typing-indicator">
                     <div className="typing-dot"></div>

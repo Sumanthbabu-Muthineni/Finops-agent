@@ -175,9 +175,10 @@ def test_universal_sql_compiler():
     print(f"⏱️  [Zero-LLM SQL Compiler Latency]: {compile_latency_ms:.3f} ms (sub-millisecond execution)")
 
     assert "v_transactions" in sql
-    assert "UPPER(CAST(bank_name AS VARCHAR)) = UPPER('HDFC BANK LIMITED')" in sql
-    assert "UPPER(CAST(transaction_type AS VARCHAR)) = UPPER('debit')" in sql
-    assert "GROUP BY program_id" in sql
+    char_type = "CHAR" if db.is_mysql else "VARCHAR"
+    assert f"UPPER(CAST(bank_name AS {char_type})) = UPPER('HDFC BANK LIMITED')" in sql
+    assert f"UPPER(CAST(transaction_type AS {char_type})) = UPPER('debit')" in sql
+    assert "GROUP BY `program_id`" in sql or "GROUP BY program_id" in sql
     print("✅ Verified: Zero-LLM SQL compilation is deterministic, injection-proof, and dual-query enabled.")
 
 def test_full_graph_banking_breakdown():

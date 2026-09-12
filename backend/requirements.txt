@@ -1,5 +1,6 @@
-# Core Database Engine (PostgreSQL Native)
-psycopg2-binary>=2.9.9
+# Core Database Engine (MySQL 8.0 Native)
+pymysql>=1.1.0
+cryptography>=41.0.0
 sqlglot>=23.0.0
 pandas>=2.1.0
 numpy>=1.24.0

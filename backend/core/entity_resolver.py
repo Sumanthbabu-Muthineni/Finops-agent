@@ -17,11 +17,21 @@ class EntityResolver:
         self.accounts = []
         self.categories = []
 
-        # Query exact bank_code to bank_name mapping from PostgreSQL
+        # Query entity code to name mapping from database if present
         try:
-            b_df, _, _ = db.execute_query("SELECT bank_code, bank_name FROM bank;")
-            self.code_to_name = dict(zip(b_df["bank_code"], b_df["bank_name"]))
-            self.name_to_code = dict(zip(b_df["bank_name"], b_df["bank_code"]))
+            tables = db.get_tables_and_views()
+            if "bank" in tables or "v_banks" in tables:
+                tbl = "v_banks" if "v_banks" in tables else "bank"
+                b_df, _, count = db.execute_query(f"SELECT bank_code, bank_name FROM `{tbl}`;")
+                if count > 0 and "bank_code" in b_df.columns and "bank_name" in b_df.columns:
+                    self.code_to_name = dict(zip(b_df["bank_code"], b_df["bank_name"]))
+                    self.name_to_code = dict(zip(b_df["bank_name"], b_df["bank_code"]))
+                else:
+                    self.code_to_name = {}
+                    self.name_to_code = {}
+            else:
+                self.code_to_name = {}
+                self.name_to_code = {}
         except Exception:
             self.code_to_name = {}
             self.name_to_code = {}

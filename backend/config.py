@@ -26,15 +26,23 @@ class Settings(BaseSettings):
     GROQ_API_KEY: str = ""
     GROQ_MODEL: str = "llama-3.1-8b-instant"
 
-    # Database Configuration (PostgreSQL Native)
-    DATABASE_URL: str = "postgresql://postgres:postgres@localhost:5432/finops"
-    POSTGRES_HOST: str = "localhost"
-    POSTGRES_PORT: int = 5432
-    POSTGRES_DB: str = "finops"
-    POSTGRES_USER: str = "postgres"
-    POSTGRES_PASSWORD: str = "postgres"
-    POSTGRES_POOL_MIN: int = 2
-    POSTGRES_POOL_MAX: int = 20
+    # Database Configuration (MySQL 8.0 Engine - loaded from .env)
+    DB_ENGINE: str = "mysql"
+    DATABASE_URL: str = ""
+    
+    # MySQL Settings (loaded from .env)
+    MYSQL_HOST: str = "localhost"
+    MYSQL_PORT: int = 3306
+    MYSQL_DB: str = ""
+    MYSQL_USER: str = ""
+    MYSQL_PASSWORD: str = ""
+    # Database Pool Settings
+    DB_POOL_MIN: int = 2
+    DB_POOL_MAX: int = 20
+
+    @property
+    def is_mysql(self) -> bool:
+        return True
     
     # Evaluator Hash / Encryption Key (for UTR encryption at rest)
     HASH_KEY: str = "finops-evaluator-secret-hashkey-2026"
@@ -54,32 +62,3 @@ class Settings(BaseSettings):
         return [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
 
 settings = Settings()
-
-# Official TBX Relational Schema Table Definitions
-DATASET_SCHEMA_MAPPINGS = {
-    "bank": {
-        "table": "bank",
-        "code_col": "bank_code",
-        "name_col": "bank_name"
-    },
-    "account": {
-        "table": "account",
-        "id_col": "account_id",
-        "entity_id_col": "entity_id",
-        "account_number_col": "account_number",
-        "program_id_col": "program_id",
-        "balance_col": "available_balance",
-        "bank_code_col": "bank_code"
-    },
-    "transaction": {
-        "table": "transaction",
-        "id_col": "transaction_id",
-        "account_id_col": "account_id",
-        "date_col": "transaction_date",
-        "type_col": "transaction_type",
-        "description_col": "description",
-        "amount_col": "transaction_amount",
-        "reference_id_col": "transaction_reference_id",
-        "utr_col": "utr_number"
-    }
-}

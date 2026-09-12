@@ -83,7 +83,7 @@ def test_balance_and_breakdown_compilation():
     sql_type = query_compiler.compile(ast_type)
     print(f"✅ Compiled Breakdown SQL: {sql_type}")
     assert "v_transactions" in sql_type
-    assert "GROUP BY transaction_type" in sql_type
+    assert "GROUP BY `transaction_type`" in sql_type or "GROUP BY transaction_type" in sql_type
     df_t, _, _ = db.execute_query(sql_type)
     assert len(df_t) == 2  # credit and debit
 

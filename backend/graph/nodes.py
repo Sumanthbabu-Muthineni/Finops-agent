@@ -125,7 +125,7 @@ def ast_generator_node(state: FinancialAgentState) -> Dict[str, Any]:
     }
 
 def sql_compiler_node(state: FinancialAgentState) -> Dict[str, Any]:
-    """Node 3: Deterministic compilation from AST to parameterized PostgreSQL SQL."""
+    """Node 3: Deterministic compilation from AST to parameterized MySQL ANSI-SQL."""
     ast_dict = state["current_ast"]
     ast_obj = FinancialQueryAST(**ast_dict)
 
@@ -138,7 +138,7 @@ def sql_compiler_node(state: FinancialAgentState) -> Dict[str, Any]:
     }
 
 def db_execution_and_iqr_node(state: FinancialAgentState) -> Dict[str, Any]:
-    """Node 4: Executes PostgreSQL SQL (zero LLM math) and triggers IQR Anomaly Hook."""
+    """Node 4: Executes MySQL ANSI-SQL (zero LLM math) and triggers IQR Anomaly Hook."""
     compiled_sql = state["compiled_sql"]
     records_sql = state["records_sql"]
 
@@ -371,7 +371,7 @@ def clarification_node(state: FinancialAgentState) -> Dict[str, Any]:
     }
 
 def synthesizer_node(state: FinancialAgentState) -> Dict[str, Any]:
-    """Node 6B: Zero-Math synthesis using PostgreSQL calculated values."""
+    """Node 6B: Zero-Math synthesis using MySQL relational calculated values."""
     query = state["user_query"]
     anomaly_dict = state.get("anomaly", {})
     anomaly_obj = AnomalyInfo(**anomaly_dict) if anomaly_dict else AnomalyInfo()
