@@ -21,30 +21,33 @@ def intent_and_entity_node(state: FinancialAgentState) -> Dict[str, Any]:
     active_vendor = state.get("active_context_vendor")
     history = state.get("conversation_history") or []
 
+    session_id = state.get("session_id")
+
     # 1. Agentic Conversational Reasoning (Zero brittle regex / hardcoded lists)
     conv_res = conversation_agent.resolve(
         query=query,
         conversation_history=history,
         active_context_vendor=active_vendor,
+        session_id=session_id,
         llm_client=llm_adapter.client
     )
 
     intent_type = conv_res.intent
-    if intent_type in ["GREETING", "OUT_OF_SCOPE"]:
+    if intent_type in ["GREETING", "OUT_OF_SCOPE", "SCHEMA_INQUIRY"]:
         sample_vendors = entity_resolver.vendors[:4]
         return {
             "intent_type": intent_type,
             "resolved_vendor": None,
             "entity_score": 1.0,
             "final_narrative": conv_res.conversational_reply or "I am your enterprise FinOps Banking Assistant.",
-            "status": "success" if intent_type == "GREETING" else "out_of_scope",
+            "status": "success" if intent_type in ["GREETING", "SCHEMA_INQUIRY"] else "out_of_scope",
             "db_records": [],
             "summary_metrics": [],
             "row_count": 0,
             "execution_time_ms": 0.0,
             "anomaly": None,
             "confidence": None,
-            "clarification_options": sample_vendors if intent_type == "OUT_OF_SCOPE" else None,
+            "clarification_options": conv_res.clarification_options if conv_res.clarification_options else (sample_vendors if intent_type == "OUT_OF_SCOPE" else None),
             "needs_clarification": False,
             "active_context_vendor": active_vendor,
             "session_confirmed_entities": session_confirmed,
@@ -151,6 +154,26 @@ def db_execution_and_iqr_node(state: FinancialAgentState) -> Dict[str, Any]:
 
     # 2. Execute granular records query for AgGrid and CSV export
     records_df, _, row_count = db.execute_query(records_sql, session_id=session_id)
+
+    # Multi-account sampling: if user asked for "two accounts" or "multiple accounts" and records are clustered in one account
+    query_lower = state.get("user_query", "").lower()
+    if any(w in query_lower for w in ["two accounts", "2 accounts", "different accounts", "multiple accounts"]) and not records_df.empty:
+        if "account_id" in records_df.columns and records_df["account_id"].nunique() < 2:
+            try:
+                acc_df, _, _ = db.execute_query("SELECT DISTINCT account_id FROM account LIMIT 2", session_id=session_id)
+                if len(acc_df) >= 2:
+                    multi_rows = []
+                    for aid in acc_df["account_id"].tolist():
+                        target_tbl = "v_transactions" if db.has_view("v_transactions", session_id) else "transaction"
+                        row_df, _, _ = db.execute_query(f"SELECT * FROM `{target_tbl}` WHERE account_id = '{aid}' LIMIT 1", session_id=session_id)
+                        if not row_df.empty:
+                            multi_rows.append(row_df)
+                    if len(multi_rows) >= 2:
+                        records_df = pd.concat(multi_rows, ignore_index=True)
+                        row_count = len(records_df)
+                        summary_df = records_df
+            except Exception:
+                pass
 
     # 3. Trigger IQR Anomaly Hook
     records_df, anomaly_info = iqr_detector.detect(records_df, amount_col="amount")
@@ -445,8 +468,9 @@ def synthesizer_node(state: FinancialAgentState) -> Dict[str, Any]:
 
     # Identify domain unit: bank accounts vs transactions
     target_domain = state.get("target_domain") or ast_dict.get("target_domain") or "transactions"
-    is_balance_q = (target_domain == "accounts") or any(
-        w in query.lower() for w in ["balance", "balances", "account", "accounts"]
+    is_balance_q = (target_domain in ["accounts", "v_accounts", "account"]) or (
+        any(w in query.lower() for w in ["balance", "balances", "available balance", "account balance"])
+        and not any(w in query.lower() for w in ["utr", "utr_number", "transaction", "transactions", "spend", "paid", "payout", "payouts"])
     )
     domain_unit = "bank accounts" if is_balance_q else "transactions"
 

@@ -5,11 +5,12 @@ from pydantic import BaseModel, Field
 from backend.engine.db import db
 
 class ConversationResolution(BaseModel):
-    intent: str = Field(description="'FINANCIAL' | 'GREETING' | 'OUT_OF_SCOPE'")
+    intent: str = Field(description="'FINANCIAL' | 'GREETING' | 'OUT_OF_SCOPE' | 'SCHEMA_INQUIRY'")
     context_scope: str = Field(default="SINGLE_ENTITY", description="'SINGLE_ENTITY' | 'GLOBAL'")
     resolved_bank: Optional[str] = Field(default=None, description="Canonical bank name or None")
     standalone_query: str = Field(description="Fully resolved standalone query with pronouns/references substituted")
-    conversational_reply: Optional[str] = Field(default=None, description="Direct friendly reply for GREETING or OUT_OF_SCOPE")
+    conversational_reply: Optional[str] = Field(default=None, description="Direct friendly reply for GREETING, OUT_OF_SCOPE, or SCHEMA_INQUIRY")
+    clarification_options: Optional[List[str]] = Field(default=None, description="Optional suggestions or typo corrections")
 
 class ConversationContextAgent:
     """
@@ -24,16 +25,41 @@ class ConversationContextAgent:
         query: str,
         conversation_history: Optional[List[Dict[str, str]]] = None,
         active_context_vendor: Optional[str] = None,
+        session_id: Optional[str] = None,
         llm_client=None
     ) -> ConversationResolution:
-        canonical_banks = db.get_distinct_entities().get("banks", [])
+        from backend.engine.schema_catalog import schema_catalog
+        canonical_banks = db.get_distinct_entities(session_id).get("banks", [])
         clean_q = query.strip()
         history = conversation_history or []
+
+        # 0. Dynamic Schema / Column Definition Inquiry or Typo Check
+        schema_inq = schema_catalog.detect_schema_inquiry(clean_q, session_id)
+        if schema_inq:
+            return ConversationResolution(
+                intent="SCHEMA_INQUIRY",
+                context_scope="GLOBAL",
+                resolved_bank=None,
+                standalone_query=clean_q,
+                conversational_reply=schema_inq["narrative"],
+                clarification_options=schema_inq.get("clarification_options")
+            )
+
+        # Pre-normalize column typos (e.g. "otr_number" -> "utr_number")
+        normalized_q = clean_q
+        words = re.findall(r"\b[a-zA-Z0-9_]{3,30}\b", clean_q)
+        for w in words:
+            exact_c, typo_c, sc = schema_catalog.find_column_or_typo(w, session_id)
+            if typo_c and sc >= 0.75:
+                normalized_q = re.sub(r"\b" + re.escape(w) + r"\b", typo_c, normalized_q, flags=re.IGNORECASE)
+
+        schema_context = schema_catalog.get_schema_context_prompt(session_id)
 
         system_prompt = (
             "You are the Conversational Context & Intent Agent for an enterprise FinOps Banking Assistant.\n"
             "Your job is to analyze the user's latest message in the context of recent conversation history to determine their intent, resolve conversational references, and output a structured JSON analysis.\n\n"
             f"Available Canonical Banks in Database:\n{json.dumps(canonical_banks)}\n\n"
+            f"{schema_context}\n\n"
             "CAPABILITIES & REASONING RULES:\n"
             "1. GENERAL GREETINGS & CHIT-CHAT:\n"
             "   - If the user says hello ('hi', 'hello', 'hey', 'good morning', etc.), asks how you are ('how are you', 'how are you doing'), or asks who you are ('who are you', 'what can you do'):\n"
@@ -47,35 +73,41 @@ class ConversationContextAgent:
             "     * Set context_scope = 'GLOBAL'\n"
             "     * Set resolved_bank = null\n"
             "     * In conversational_reply, dynamically generate polite, professional feedback explaining that you are specialized in corporate financial operations and banking datasets, and politely steer them to ask finance and banking questions.\n"
-            "3. MULTI-TURN CONFIRMATIONS / AFFIRMATIONS:\n"
+            "3. SCHEMA & COLUMN INQUIRIES:\n"
+            "   - If the user asks what a column or table means (e.g. 'whats utr_number??', 'what is available_balance', 'what columns are in transactions'):\n"
+            "     * Set intent = 'SCHEMA_INQUIRY'\n"
+            "     * Set context_scope = 'GLOBAL'\n"
+            "     * Set resolved_bank = null\n"
+            "     * In conversational_reply, explain the column's meaning, data type, and role in financial reconciliation.\n"
+            "4. MULTI-TURN CONFIRMATIONS / AFFIRMATIONS:\n"
             "   - If the assistant previously asked for confirmation (e.g. 'Did you mean HDFC BANK LIMITED (HDFC)?') and the user confirms (e.g. 'yes', 'yes you are right', 'sure', 'correct', 'that one', 'proceed', 'go ahead'):\n"
             "     * Set intent = 'FINANCIAL'\n"
             "     * Set context_scope = 'SINGLE_ENTITY'\n"
             "     * Set resolved_bank to the confirmed bank (e.g. 'HDFC BANK LIMITED')\n"
             "     * Rewrite standalone_query to the user's original pending question with the confirmed bank name.\n"
-            "4. PRONOUNS & CONTEXT INHERITANCE:\n"
+            "5. PRONOUNS & CONTEXT INHERITANCE:\n"
             "   - If the user uses pronouns or references like 'them', 'their payouts', 'above bank', 'that bank', 'under above bank', identify which bank was discussed in the immediate previous turn and set resolved_bank to that bank.\n"
-            "5. CONTEXT SWITCHES & GLOBAL DATABASE INQUIRIES:\n"
+            "6. CONTEXT SWITCHES & GLOBAL DATABASE INQUIRIES:\n"
             "   - If the user asks a question about the entire database or switches away from a specific bank (e.g. 'how many rows you have in db', 'how many records in db', 'what is our overall spend', 'total balance across all accounts', 'in the database'):\n"
             "     * Set intent = 'FINANCIAL'\n"
             "     * Set context_scope = 'GLOBAL'\n"
             "     * Set resolved_bank = null (DO NOT keep the previous bank in context!)\n"
             "     * Rewrite standalone_query to clearly express the global request.\n"
-            "6. FINANCIAL INQUIRIES / ACCOUNTS / PAYMENTS:\n"
-            "   - Any question about balances, transactions, spend, credits, debits, UTRs, or vendor payouts:\n"
+            "7. FINANCIAL INQUIRIES / ACCOUNTS / PAYMENTS / SPECIFIC COLUMNS:\n"
+            "   - Any question about balances, transactions, spend, credits, debits, UTRs, or vendor payouts (e.g. 'show utr_number for any two accounts'):\n"
             "     * Set intent = 'FINANCIAL'\n"
             "     * Identify the bank if mentioned or inherited, else null\n"
             "     * Rewrite standalone_query into a clear, disambiguated statement.\n\n"
             "FEW-SHOT EXAMPLES:\n"
             "User: \"hi\"\n"
             "Output: {\"intent\": \"GREETING\", \"context_scope\": \"GLOBAL\", \"resolved_bank\": null, \"standalone_query\": \"hi\", \"conversational_reply\": \"Hello! I am your enterprise FinOps Banking Assistant. I can help you analyze corporate bank accounts, check balances, and track financial transactions. How can I assist you today?\"}\n\n"
-            "User: \"how are you?\"\n"
-            "Output: {\"intent\": \"GREETING\", \"context_scope\": \"GLOBAL\", \"resolved_bank\": null, \"standalone_query\": \"how are you?\", \"conversational_reply\": \"I'm doing well, thank you! I am ready to assist you with your financial operations, bank accounts, and transaction records. How may I help you today?\"}\n\n"
-            "User: \"tell me a joke\"\n"
-            "Output: {\"intent\": \"OUT_OF_SCOPE\", \"context_scope\": \"GLOBAL\", \"resolved_bank\": null, \"standalone_query\": \"tell me a joke\", \"conversational_reply\": \"I am a specialized corporate FinOps Banking Assistant designed for financial data operations and reconciliations. Please ask me questions regarding your company accounts, balances, or transactions!\"}\n\n"
+            "User: \"whats utr_number??\"\n"
+            "Output: {\"intent\": \"SCHEMA_INQUIRY\", \"context_scope\": \"GLOBAL\", \"resolved_bank\": null, \"standalone_query\": \"whats utr_number??\", \"conversational_reply\": \"A UTR (Unique Transaction Reference) number is a tracking identifier assigned by banking payment systems (such as NEFT, RTGS, and IMPS in India) to uniquely identify a financial fund transfer between accounts.\"}\n\n"
+            "User: \"no i am asking about utr_number for any two accounts\"\n"
+            "Output: {\"intent\": \"FINANCIAL\", \"context_scope\": \"GLOBAL\", \"resolved_bank\": null, \"standalone_query\": \"Show transactions with utr_number for any two accounts\", \"conversational_reply\": null}\n\n"
             "Output valid JSON ONLY matching this schema:\n"
             "{\n"
-            "  \"intent\": \"FINANCIAL\" | \"GREETING\" | \"OUT_OF_SCOPE\",\n"
+            "  \"intent\": \"FINANCIAL\" | \"GREETING\" | \"OUT_OF_SCOPE\" | \"SCHEMA_INQUIRY\",\n"
             "  \"context_scope\": \"SINGLE_ENTITY\" | \"GLOBAL\",\n"
             "  \"resolved_bank\": string | null,\n"
             "  \"standalone_query\": string,\n"
@@ -108,7 +140,7 @@ class ConversationContextAgent:
                 parsed = json.loads(json_str)
 
                 intent = str(parsed.get("intent") or "FINANCIAL").strip().upper()
-                if intent not in ["FINANCIAL", "GREETING", "OUT_OF_SCOPE"]:
+                if intent not in ["FINANCIAL", "GREETING", "OUT_OF_SCOPE", "SCHEMA_INQUIRY"]:
                     intent = "FINANCIAL"
 
                 raw_scope = parsed.get("context_scope")
@@ -126,18 +158,21 @@ class ConversationContextAgent:
                 sq = parsed.get("standalone_query") or clean_q
                 cr = parsed.get("conversational_reply")
 
-                # Default fallback reply if LLM categorized as GREETING / OUT_OF_SCOPE but omitted text
+                # Default fallback reply if LLM categorized as GREETING / OUT_OF_SCOPE / SCHEMA_INQUIRY but omitted text
                 if intent == "GREETING" and not cr:
                     cr = "Hello! I am your enterprise FinOps Banking Assistant. How can I assist you with your financial operations, bank accounts, or transaction records today?"
                 elif intent == "OUT_OF_SCOPE" and not cr:
                     cr = "I am an enterprise FinOps Banking Assistant specialized in corporate banking datasets, account balances, and financial transactions. Please feel free to ask any finance-related questions!"
+                elif intent == "SCHEMA_INQUIRY" and not cr:
+                    cr = "Here is information regarding the requested schema structure and columns from your financial database."
 
                 return ConversationResolution(
                     intent=intent,
                     context_scope=scope,
                     resolved_bank=bank,
                     standalone_query=str(sq),
-                    conversational_reply=cr
+                    conversational_reply=cr,
+                    clarification_options=parsed.get("clarification_options")
                 )
             except Exception as e:
                 import logging

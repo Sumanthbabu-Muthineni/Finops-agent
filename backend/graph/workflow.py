@@ -18,9 +18,9 @@ def should_clarify(state: FinancialAgentState) -> str:
     return "synthesizer"
 
 def route_after_intent(state: FinancialAgentState) -> str:
-    """Routes greetings, out-of-scope, and acronym confirmations immediately to END, bypassing database queries."""
+    """Routes greetings, out-of-scope, and schema inquiries immediately to END, bypassing database queries."""
     intent_type = state.get("intent_type")
-    if intent_type in ["GREETING", "OUT_OF_SCOPE"]:
+    if intent_type in ["GREETING", "OUT_OF_SCOPE", "SCHEMA_INQUIRY"]:
         return "end"
     if state.get("needs_clarification") and state.get("final_narrative"):
         return "end"

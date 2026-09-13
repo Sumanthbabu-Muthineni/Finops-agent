@@ -269,7 +269,12 @@ class MockLLMClient(BaseLLMClient):
             target_metric = "records_list"
         else:
             target_domain = "transactions"
-            is_list = any(w in lower for w in ["who paid", "show me", "list", "which", "lookup", "unusually high", "large payouts"])
+            if "v_transactions" in schema_profile:
+                target_domain = "v_transactions"
+            is_list = any(w in lower for w in [
+                "who paid", "show me", "list", "which", "lookup", "unusually high", "large payouts",
+                "utr", "utr_number", "for any two", "two accounts", "2 accounts", "sample", "show records"
+            ])
             is_agg = any(w in lower for w in ["how much", "what amount", "total", "spend", "payment made", "combined"])
             target_metric = "total_amount" if (group_by or (is_agg and not is_list)) else ("records_list" if is_list else "total_amount")
 
@@ -334,6 +339,13 @@ class MockLLMClient(BaseLLMClient):
             except Exception:
                 pass
 
+        mock_limit = 100
+        num_map = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "ten": 10}
+        lim_match = re.search(r"\b(?:for\s+(?:any\s+)?|sample\s+|show\s+|top\s+)?(\d+|one|two|three|four|five|ten)\s+(?:accounts?|records?|transactions?)\b", lower)
+        if lim_match:
+            lim_val = lim_match.group(1).lower()
+            mock_limit = int(lim_val) if lim_val.isdigit() else num_map.get(lim_val, 100)
+
         return json.dumps({
             "target_domain": target_domain,
             "target_metric": target_metric,
@@ -341,7 +353,7 @@ class MockLLMClient(BaseLLMClient):
             "date_range": date_range,
             "group_by": group_by,
             "order_by_desc": True,
-            "limit": 100
+            "limit": mock_limit
         })
 
 class LLMAdapter:
@@ -385,16 +397,18 @@ class LLMAdapter:
             "   - 'total_amount': when the user asks for total, spend, volume, balance, or sum.\n"
             "   - 'record_count': when the user asks 'how many', 'count', 'number of transactions', 'how many rows in db', or sizing.\n"
             "   - 'average_amount': when the user asks for average or mean.\n"
-            "   - 'records_list': when the user asks to 'list', 'show all', 'which', or lookup individual records or reference IDs.\n"
-            "3. GROUPING & BREAKDOWNS:\n"
+            "   - 'records_list': when the user asks to 'list', 'show', 'which', lookup individual records or reference IDs, or requests specific column values (e.g. 'utr_number for any two accounts', 'show utr numbers', 'reference ids', 'sample records').\n"
+            "3. RECORD LIMIT & SAMPLING:\n"
+            "   - When the user specifies a quantity of accounts or records (e.g. 'for any two accounts', 'for 2 accounts', 'sample 5 records', 'top 3'), set 'limit' to that number (e.g. 2, 5, 3). Default limit is 100.\n"
+            "4. GROUPING & BREAKDOWNS:\n"
             "   - When comparing or breaking down across categories (e.g. 'by company', 'by bank', 'by type', 'credit vs debit', 'by program'), set 'group_by' to the matching column name (e.g. ['bank_name'], ['transaction_type'], ['program_id']).\n"
             "   - For spending trends over time ('monthly trend', 'over time'), add 'month' or 'year' to 'group_by'.\n"
-            "4. TEMPORAL BOUNDARIES (Evaluation Anchor: " + str(anchor) + "):\n"
+            "5. TEMPORAL BOUNDARIES (Evaluation Anchor: " + str(anchor) + "):\n"
             "   - 'this month': start of current anchor month to end of anchor month.\n"
             "   - 'last month': start of previous month to end of previous month.\n"
             "   - 'last 3 months': 3 months prior to anchor date to anchor date.\n"
             "   - Exact date or month-year: format ISO YYYY-MM-DD boundaries in 'date_range'.\n"
-            "5. NUMERIC THRESHOLDS:\n"
+            "6. NUMERIC THRESHOLDS:\n"
             "   - When filtering by amount (e.g. 'more than 10000', 'over 50000'): add entity_filter with operator 'gt', 'lt', 'gte', or 'lte'.\n\n"
             "Output valid JSON ONLY matching the FinancialQueryAST schema:\n"
             "{\n"
@@ -531,6 +545,20 @@ class LLMAdapter:
                             parsed["target_metric"] = "total_amount"
                             break
 
+            # Limit and column record detection
+            num_words_map = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "ten": 10}
+            lim_match = re.search(r"\b(?:for\s+(?:any\s+)?|sample\s+|show\s+|top\s+)?(\d+|one|two|three|four|five|ten)\s+(?:accounts?|records?|transactions?)\b", query.lower())
+            if lim_match:
+                val = lim_match.group(1).lower()
+                parsed["limit"] = int(val) if val.isdigit() else num_words_map.get(val, 100)
+
+            is_col_record_req = any(w in query.lower() for w in ["utr", "utr_number", "records", "sample", "reference_id", "for any two accounts", "for 2 accounts", "two accounts"])
+            if is_col_record_req and not parsed.get("group_by") and not any(w in query.lower() for w in ["how much", "what total", "sum of", "total amount"]):
+                parsed["target_metric"] = "records_list"
+                all_views = db.get_tables_and_views(session_id)
+                if "v_transactions" in all_views:
+                    parsed["target_domain"] = "v_transactions"
+
             return FinancialQueryAST(**parsed)
         except Exception:
             # Fallback to deterministic mock interpretation
@@ -549,6 +577,8 @@ class LLMAdapter:
     ) -> str:
         """Invokes LLM (e.g. Bedrock) to generate a grounded natural language narrative from PostgreSQL facts."""
         from backend.engine.db import db
+
+        is_balance_q = (unit == "bank accounts") and not any(w in query.lower() for w in ["utr", "utr_number", "transaction", "transactions", "spend", "paid", "payout", "payouts"])
 
         # 1. Dynamic LLM Prompting: Bedrock / LLM decides the text based on grounded facts
         if not isinstance(self.client, MockLLMClient):
@@ -619,8 +649,24 @@ class LLMAdapter:
                             amt = t.get("transaction_amount") if t.get("transaction_amount") is not None else t.get("amount", 0.0)
                             desc = t.get("description") or "N/A"
                             ttype = t.get("transaction_type") or ""
-                            tx_summaries.append(f"  * Date: {dt} | Type: {ttype} | Amount: ${float(amt):,.2f} | Narration/Payee: {desc}")
-                        facts.append("Sample Transactions (Extract Payee/Creditor from Narration):\n" + "\n".join(tx_summaries))
+                            utr = t.get("masked_utr_number") or t.get("utr_number")
+                            acc = t.get("masked_account_number") or t.get("account_number")
+                            bank = t.get("bank_name") or t.get("bank_code")
+                            ref = t.get("transaction_reference_id") or t.get("reference_id")
+
+                            items = [f"Date: {dt}", f"Type: {ttype}", f"Amount: ${float(amt):,.2f}"]
+                            if utr:
+                                items.append(f"UTR: {utr}")
+                            if acc:
+                                items.append(f"Account: {acc}")
+                            if bank:
+                                items.append(f"Bank: {bank}")
+                            if ref:
+                                items.append(f"Ref: {ref}")
+                            if desc != "N/A":
+                                items.append(f"Narration: {desc}")
+                            tx_summaries.append("  * " + " | ".join(items))
+                        facts.append("Sample Transactions / Records:\n" + "\n".join(tx_summaries))
 
                 if anomaly and anomaly.detected:
                     facts.append(f"Statistical Anomaly Detected: {anomaly.message}")
@@ -634,7 +680,6 @@ class LLMAdapter:
 
         # 2. Deterministic Fallback Synthesizer (for MockLLMClient and offline testing)
         parts = []
-        is_balance_q = any(w in query.lower() for w in ["balance", "balances", "available balance", "account balance"])
 
         if breakdown_items and len(breakdown_items) > 0:
             is_credit_debit = all(item.get("name", "").upper() in ["CREDIT", "DEBIT"] for item in breakdown_items)
@@ -686,7 +731,17 @@ class LLMAdapter:
             count = metrics.get("record_count")
             avg = metrics.get("average_amount")
 
-            if len(sample_rows) == 1 and any(w in query.lower() for w in ["reference", "receipt", "lookup", "ref"]):
+            is_utr_q = any(w in query.lower() for w in ["utr", "utr_number", "otr"])
+            if is_utr_q and sample_rows:
+                utr_lines = []
+                for r in sample_rows[:10]:
+                    utr = r.get("masked_utr_number") or r.get("utr_number") or "N/A"
+                    acc = r.get("masked_account_number") or r.get("account_number") or "Unknown"
+                    bank = r.get("bank_name") or r.get("bank_code") or "Corporate Account"
+                    amt = float(r.get("transaction_amount") or r.get("amount") or 0.0)
+                    utr_lines.append(f"• **Bank:** {bank} | **Account:** `{acc}` | **UTR:** `{utr}` | **Amount:** ${amt:,.2f}")
+                parts.append("Here are the transaction records and UTR numbers for your request:\n\n" + "\n".join(utr_lines))
+            elif len(sample_rows) == 1 and any(w in query.lower() for w in ["reference", "receipt", "lookup", "ref"]):
                 row = sample_rows[0]
                 bank = row.get("bank_name") or row.get("bank_code") or ""
                 amt = float(row.get("transaction_amount") or row.get("amount") or 0.0)
@@ -694,7 +749,7 @@ class LLMAdapter:
                 ref = row.get("transaction_reference_id") or row.get("reference_id") or ""
                 acc = row.get("masked_account_number") or ""
                 parts.append(f"Found matching **{t_type}** transaction: reference **{ref}** for **${amt:,.2f}** at **{bank}** (Account {acc}).")
-            elif total is not None and count is not None:
+            elif total is not None and count is not None and not is_utr_q:
                 noun = "accounts" if is_balance_q else "transactions"
                 lead = "Total available balance is" if is_balance_q else "Total calculated is"
                 parts.append(f"{lead} **${float(total):,.2f}** across **{count}** {noun}.")
