@@ -1,3 +1,4 @@
+import re
 from typing import Dict, Any, List
 from datetime import datetime
 import pandas as pd
@@ -316,7 +317,12 @@ def db_execution_and_iqr_node(state: FinancialAgentState) -> Dict[str, Any]:
     is_pure_aggregate = (
         not has_grouping 
         and ast_metric in ["total_amount", "available_balance", "average_amount", "record_count"]
-        and not any(w in user_q for w in ["show", "list", "lookup", "details", "recent", "find", "top", "negative", "transactions", "records", "accounts", "how many accounts", "how many accoutns", "which accounts", "who paid", "who credited", "creditor"])
+        and not any(w in user_q for w in [
+            "show", "list", "lookup", "details", "recent", "find", "top", "negative",
+            "transactions", "records", "accounts", "how many accounts", "how many accoutns",
+            "which accounts", "who paid", "who credited", "creditor", "export", "download",
+            "csv", "table", "grid", "payout", "payouts"
+        ])
     )
 
     if is_pure_aggregate:
@@ -326,6 +332,23 @@ def db_execution_and_iqr_node(state: FinancialAgentState) -> Dict[str, Any]:
         clean_records_df = records_df.copy()
         # SENSITIVE DATA MASKING (Mandatory): Never leak raw account numbers or full UTR hashes
         clean_records_df = mask_records_dataframe(clean_records_df)
+
+        # If user asked for top N / highest amounts, sort records_df accordingly
+        top_match = re.search(r"\b(?:top|highest|largest|biggest|maximum)\s+(\d+)\b", user_q)
+        if top_match and not clean_records_df.empty:
+            top_n = int(top_match.group(1))
+            amt_col = "transaction_amount" if "transaction_amount" in clean_records_df.columns else ("amount" if "amount" in clean_records_df.columns else None)
+            if amt_col:
+                clean_records_df = clean_records_df.sort_values(by=amt_col, ascending=False).head(top_n)
+        elif any(w in user_q for w in ["top", "highest", "largest", "biggest"]) and not clean_records_df.empty:
+            amt_col = "transaction_amount" if "transaction_amount" in clean_records_df.columns else ("amount" if "amount" in clean_records_df.columns else None)
+            if amt_col:
+                clean_records_df = clean_records_df.sort_values(by=amt_col, ascending=False)
+        elif any(w in user_q for w in ["recent", "latest"]) and not clean_records_df.empty:
+            dt_col = "transaction_date" if "transaction_date" in clean_records_df.columns else ("date" if "date" in clean_records_df.columns else None)
+            if dt_col:
+                clean_records_df = clean_records_df.sort_values(by=dt_col, ascending=False)
+
         clean_records_df = clean_records_df.astype(object).where(pd.notnull(clean_records_df), None)
         records_list = clean_records_df.head(100).to_dict(orient="records")
 

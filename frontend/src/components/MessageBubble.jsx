@@ -1,8 +1,10 @@
-import React from 'react';
-import { AlertTriangle, Bot, User } from 'lucide-react';
+import React, { useState, useMemo } from 'react';
+import { AlertTriangle, Bot, User, Table, ChevronDown, ChevronUp } from 'lucide-react';
 import { KpiMetrics } from './KpiMetrics';
 import { AuditDrawer } from './AuditDrawer';
 import { ConfidenceBadge } from './ConfidenceBadge';
+import { FinancialAgGrid, prepareExportData } from './FinancialAgGrid';
+import { CsvExportButton } from './CsvExportButton';
 
 const renderNarrative = (text) => {
   if (!text) return null;
@@ -76,6 +78,7 @@ const renderNarrative = (text) => {
 
 export const MessageBubble = ({ message, onOptionClick }) => {
   const isUser = message.role === 'user';
+  const [showTable, setShowTable] = useState(false);
 
   if (isUser) {
     return (
@@ -98,8 +101,18 @@ export const MessageBubble = ({ message, onOptionClick }) => {
     anomaly,
     summary_metrics,
     audit_trail,
-    clarification_options
+    clarification_options,
+    table_data
   } = message;
+
+  const hasRecords = Array.isArray(table_data) && table_data.length > 0;
+  const exportData = useMemo(() => prepareExportData(table_data), [table_data]);
+
+  // Safety limits on export: do not allow exporting unbounded full-database scans
+  const totalScanned = audit_trail?.rows_scanned || (hasRecords ? table_data.length : 0);
+  const isAllScan = totalScanned > 500;
+  const canExport = hasRecords && !isAllScan && table_data.length <= 100;
+  const isCapped = totalScanned > 100 && table_data.length === 100;
 
   return (
     <div className="message-wrapper assistant">
@@ -152,6 +165,58 @@ export const MessageBubble = ({ message, onOptionClick }) => {
 
           {/* KPI Summary Cards */}
           <KpiMetrics metrics={summary_metrics} />
+
+          {/* Collapsible Records Table & 1-Click CSV Export */}
+          {hasRecords && (
+            <div className="table-toggle-wrapper" style={{ marginTop: 14 }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
+                <button
+                  onClick={() => setShowTable(prev => !prev)}
+                  className="btn-table-toggle"
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 6,
+                    background: showTable ? 'rgba(59, 130, 246, 0.18)' : 'rgba(30, 41, 59, 0.65)',
+                    border: `1px solid ${showTable ? 'rgba(59, 130, 246, 0.5)' : 'rgba(71, 85, 105, 0.4)'}`,
+                    color: showTable ? '#60a5fa' : '#cbd5e1',
+                    padding: '6px 12px',
+                    borderRadius: 6,
+                    fontSize: '0.78rem',
+                    fontWeight: 600,
+                    cursor: 'pointer',
+                    transition: 'all 0.15s ease'
+                  }}
+                  title={showTable ? "Click to collapse AG Grid" : "Click to view interactive data grid"}
+                >
+                  <Table size={14} />
+                  <span>{showTable ? 'Hide Records Table' : `View Records Table (${table_data.length} ${table_data.length === 1 ? 'item' : 'items'})`}</span>
+                  {showTable ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                </button>
+
+                {canExport ? (
+                  <CsvExportButton
+                    data={exportData}
+                    filename="financial_records.csv"
+                    label={isCapped ? `Export CSV (Top ${table_data.length})` : "Export CSV"}
+                  />
+                ) : isAllScan ? (
+                  <span style={{ fontSize: '0.74rem', color: '#94a3b8', background: 'rgba(148, 163, 184, 0.08)', padding: '3px 8px', borderRadius: 4 }}>
+                    CSV export restricted for full-database queries
+                  </span>
+                ) : null}
+              </div>
+
+              {showTable && (
+                <div style={{ marginTop: 10 }}>
+                  <FinancialAgGrid
+                    rowData={table_data}
+                    totalRowsScanned={audit_trail?.rows_scanned}
+                  />
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Expandable Audit Drawer */}
           <AuditDrawer auditTrail={audit_trail} confidence={confidence} />

@@ -37,7 +37,24 @@ const COLUMN_ORDER = [
   'utr_number'
 ];
 
-export const FinancialAgGrid = ({ rowData }) => {
+export const prepareExportData = (rowData) => {
+  if (!rowData || !rowData.length) return [];
+  const sample = rowData[0];
+  return rowData.map(row => {
+    const clean = {};
+    Object.keys(row).forEach(k => {
+      if (['account_id', 'entity_id', 'transaction_id', 'is_outlier', 'txn_year', 'txn_month'].includes(k)) return;
+      if (k === 'masked_account_number' && 'account_number' in sample) return;
+      if (k === 'masked_utr_number' && 'utr_number' in sample) return;
+      if (k === 'amount' && 'transaction_amount' in sample) return;
+      if (k === 'reference_id' && 'transaction_reference_id' in sample) return;
+      clean[k] = row[k];
+    });
+    return clean;
+  });
+};
+
+export const FinancialAgGrid = ({ rowData, totalRowsScanned = 0 }) => {
   if (!rowData || rowData.length === 0) return null;
 
   // Filter and sort column definitions cleanly
@@ -137,17 +154,7 @@ export const FinancialAgGrid = ({ rowData }) => {
   }, [rowData]);
 
   // Clean data for CSV export without internal UUIDs
-  const exportableData = useMemo(() => {
-    return rowData.map(row => {
-      const clean = {};
-      Object.keys(row).forEach(k => {
-        if (!INTERNAL_COLUMNS.has(k)) {
-          clean[k] = row[k];
-        }
-      });
-      return clean;
-    });
-  }, [rowData]);
+  const exportableData = useMemo(() => prepareExportData(rowData), [rowData]);
 
   // Highlight outlier rows with custom CSS class
   const rowClassRules = useMemo(() => ({
@@ -155,7 +162,10 @@ export const FinancialAgGrid = ({ rowData }) => {
   }), []);
 
   // Limit export to reasonable client-side volume (<= 100 rows)
-  const canExportCsv = rowData.length > 0 && rowData.length <= 100;
+  const totalScanned = totalRowsScanned || rowData.length;
+  const isAllScan = totalScanned > 500;
+  const canExportCsv = !isAllScan && rowData.length > 0 && rowData.length <= 100;
+  const isCapped = totalScanned > 100 && rowData.length === 100;
 
   return (
     <div className="table-section">
@@ -164,9 +174,17 @@ export const FinancialAgGrid = ({ rowData }) => {
           {rowData.length === 1 ? 'Transaction Details' : `Matching Records (${rowData.length} items)`}
         </span>
         {canExportCsv ? (
-          <CsvExportButton data={exportableData} filename="financial_records.csv" />
+          <CsvExportButton 
+            data={exportableData} 
+            filename="financial_records.csv" 
+            label={isCapped ? "Export CSV (Top 100)" : "Export CSV"} 
+          />
+        ) : isAllScan ? (
+          <span style={{ fontSize: '0.74rem', color: '#94a3b8', background: 'rgba(148, 163, 184, 0.1)', padding: '3px 8px', borderRadius: '4px' }}>
+            Export restricted for full-database queries
+          </span>
         ) : (
-          <span style={{ fontSize: '0.75rem', color: '#94a3b8', background: 'rgba(148, 163, 184, 0.1)', padding: '4px 10px', borderRadius: '4px' }}>
+          <span style={{ fontSize: '0.74rem', color: '#94a3b8', background: 'rgba(148, 163, 184, 0.1)', padding: '3px 8px', borderRadius: '4px' }}>
             Large dataset ({rowData.length} rows) — export restricted on client-side
           </span>
         )}

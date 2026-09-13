@@ -1,19 +1,34 @@
 import React from 'react';
 import { Download } from 'lucide-react';
 
-export const CsvExportButton = ({ data, filename = "financial_breakdown.csv" }) => {
+export const CsvExportButton = ({ 
+  data, 
+  filename = "financial_records.csv", 
+  label = "Export CSV",
+  disabled = false 
+}) => {
   const downloadCsv = () => {
-    if (!data || data.length === 0) return;
+    if (!data || data.length === 0 || disabled) return;
 
     // Extract headers
-    const headers = Object.keys(data[0]);
-    const csvRows = [headers.join(',')];
+    const rawHeaders = Object.keys(data[0]);
+    
+    // Format headers cleanly (e.g. transaction_amount -> Transaction Amount)
+    const formattedHeaders = rawHeaders.map(h => {
+      return h
+        .split('_')
+        .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+        .join(' ');
+    });
 
-    // Format rows
-    for (const row of data) {
-      const values = headers.map(header => {
+    const csvRows = [formattedHeaders.join(',')];
+
+    // Format rows (limit to 100 max for client safety)
+    const exportRows = data.slice(0, 100);
+    for (const row of exportRows) {
+      const values = rawHeaders.map(header => {
         const val = row[header];
-        if (val === null || val === undefined) return '';
+        if (val === null || val === undefined) return '""';
         const escaped = ('' + val).replace(/"/g, '""');
         return `"${escaped}"`;
       });
@@ -33,9 +48,15 @@ export const CsvExportButton = ({ data, filename = "financial_breakdown.csv" }) 
   if (!data || data.length === 0) return null;
 
   return (
-    <button onClick={downloadCsv} className="btn-export" title="Export table to CSV">
+    <button 
+      onClick={downloadCsv} 
+      className="btn-export" 
+      disabled={disabled}
+      title={disabled ? "Export disabled" : `Export ${Math.min(data.length, 100)} records to CSV`}
+      style={disabled ? { opacity: 0.5, cursor: 'not-allowed' } : {}}
+    >
       <Download size={13} />
-      <span>Export CSV</span>
+      <span>{label}</span>
     </button>
   );
 };

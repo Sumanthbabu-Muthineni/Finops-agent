@@ -140,6 +140,6 @@ Thumbs.db
 *~
 
 # Local scratch test scripts
-test_db.py
-test_db2.py
-test_mysql.py
+scripts/test_db.py
+scripts/test_db2.py
+scripts/test_mysql.py
